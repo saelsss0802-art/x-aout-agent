@@ -65,6 +65,8 @@ Supabase の pooler を使う場合も同じ形式で、HOST/PORT を Connect �
 
 依存が不足している場合は、セットアップ手順（`pip install -r requirements.txt` / `pip install -e packages/core`）を案内して停止します。
 
+※ `dev.sh` 自体は `pip install` を実行しません。依存解決はセットアップ時に一度だけ行います。
+
 API ヘルスチェック:
 
 ```bash
