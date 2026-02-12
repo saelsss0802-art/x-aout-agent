@@ -1,0 +1,8 @@
+{
+  "name": "x-aout-web",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "echo \"Scaffold only. Initialize Next.js app when UI implementation starts.\""
+  }
+}
