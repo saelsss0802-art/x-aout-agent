@@ -1,1 +1,3 @@
-"""Shared domain models / interfaces placeholder package."""
+from .placeholders import DomainPlaceholder
+
+__all__ = ["DomainPlaceholder"]
