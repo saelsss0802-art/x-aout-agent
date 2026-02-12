@@ -10,6 +10,8 @@ if [ -f .env ]; then
   set +a
 fi
 
+python -m pip install -e packages/core --no-build-isolation >/dev/null
+
 python -m uvicorn apps.api.app.main:app --host "${API_HOST:-0.0.0.0}" --port "${API_PORT:-8000}" &
 API_PID=$!
 

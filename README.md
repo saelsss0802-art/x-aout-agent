@@ -18,6 +18,7 @@ x-aout-agent の初期骨格です。`docker compose` で Postgres + API を起�
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+pip install -e packages/core --no-build-isolation
 cp .env.example .env
 ```
 
@@ -51,8 +52,11 @@ python -m apps.worker.run_once
 
 ## マイグレーション（Alembic）
 
+`core` を editable install 済みであることを前提に、以下を実行します。
+
 ```bash
 alembic -c apps/api/alembic.ini upgrade head
+alembic -c apps/api/alembic.ini revision --autogenerate -m "check"
 ```
 
 ## テスト
