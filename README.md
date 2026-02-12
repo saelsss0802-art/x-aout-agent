@@ -18,6 +18,8 @@ x-aout-agent の monorepo 初期骨格です。**永続DBは Supabase（ホス�
 ```bash
 python -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e packages/core
 cp .env.example .env
 ```
 
@@ -27,14 +29,25 @@ cp .env.example .env
 - `SUPABASE_ANON_KEY`
 - `SUPABASE_SERVICE_ROLE_KEY`（**バックエンド専用。フロントエンドへ絶対に露出しないこと**）
 - `DATABASE_URL`（Supabase Postgres 接続文字列。Alembic / SQLAlchemy が利用）
+  - 推奨形式: `postgresql+psycopg://USER:PASSWORD@HOST:PORT/DBNAME`
 
 ### DATABASE_URL の取得方法（Supabase Dashboard）
 
 1. Supabase Dashboard で対象プロジェクトを開く
 2. **Connect** ボタンを押す
 3. Connection string をコピーして `.env` の `DATABASE_URL` に設定する
+4. SQLAlchemy で動く形（`postgresql+psycopg://...`）になっていることを確認する
 
 > 補足: ローカル回線やISP都合で IPv6 が不安定な場合は、Connect タブで **pooler（IPv4互換）** の接続先を使ってください。
+
+
+### DATABASE_URL の動作例（SQLAlchemy）
+
+```env
+DATABASE_URL=postgresql+psycopg://USER:PASSWORD@HOST:PORT/DBNAME
+```
+
+Supabase の pooler を使う場合も同じ形式で、HOST/PORT を Connect タブで示される pooler の値に置き換えてください。
 
 ## 起動方法（Docker なし）
 
@@ -44,10 +57,13 @@ cp .env.example .env
 
 `dev.sh` は以下を順に実行します。
 
-1. `pip install -r requirements.txt`
-2. `pip install -e packages/core`
-3. `DATABASE_URL` があれば `python -m alembic -c apps/api/alembic.ini upgrade head`
-4. `uvicorn` 起動 + worker 起動
+1. venv が有効かチェック
+2. 必須モジュール（`alembic`, `sqlalchemy`, `psycopg`, `uvicorn`, `core`）の import 可否をチェック
+3. `DATABASE_URL` の設定をチェック
+4. `python -m alembic -c apps/api/alembic.ini upgrade head`
+5. `uvicorn` 起動 + worker 起動
+
+依存が不足している場合は、セットアップ手順（`pip install -r requirements.txt` / `pip install -e packages/core`）を案内して停止します。
 
 API ヘルスチェック:
 
