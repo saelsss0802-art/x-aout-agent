@@ -1,16 +1,17 @@
 # x-aout-agent
 
-x-aout-agent の初期骨格です。`docker compose` で Postgres + API を起動し、worker はローカル実行できます。
+x-aout-agent の monorepo 初期骨格です。`docker compose` で Postgres + API を起動し、worker はローカル実行できます。
 
 ## ディレクトリ構成
 
 - `apps/api`: FastAPI (Supervisor/API)
 - `apps/web`: Next.js Dashboard の叩き台
 - `apps/worker`: APScheduler ベースの worker
-- `packages/core`: 共有コード置き場
+- `packages/core`: 共有コード（DB base/models/interfaces）
 - `docs`: 設計・仕様ドキュメント
 - `infra/docker-compose.yml`: ローカル開発用 compose
 - `scripts/dev.sh`: API + worker をローカルで同時起動
+- `scripts/seed.py`: ダミー seed スクリプト
 
 ## セットアップ
 
@@ -26,8 +27,7 @@ cp .env.example .env
 ### 1) Postgres + API を Docker で起動
 
 ```bash
-cd infra
-docker compose up --build
+docker compose -f infra/docker-compose.yml up --build
 ```
 
 API ヘルスチェック:
@@ -53,6 +53,12 @@ python -m apps.worker.run_once
 
 ```bash
 alembic -c apps/api/alembic.ini upgrade head
+```
+
+## Seed（ダミーデータ）
+
+```bash
+python scripts/seed.py
 ```
 
 ## テスト
