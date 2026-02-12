@@ -10,7 +10,14 @@ if [ -f .env ]; then
   set +a
 fi
 
-alembic -c apps/api/alembic.ini upgrade head
+pip install -r requirements.txt
+pip install -e packages/core
+
+if [ -n "${DATABASE_URL:-}" ]; then
+  python -m alembic -c apps/api/alembic.ini upgrade head
+else
+  echo "DATABASE_URL is not set. Skipping Alembic migration."
+fi
 
 python -m uvicorn apps.api.app.main:app --host "${API_HOST:-0.0.0.0}" --port "${API_PORT:-8000}" &
 API_PID=$!
