@@ -10,6 +10,8 @@ if [ -f .env ]; then
   set +a
 fi
 
+alembic -c apps/api/alembic.ini upgrade head
+
 python -m uvicorn apps.api.app.main:app --host "${API_HOST:-0.0.0.0}" --port "${API_PORT:-8000}" &
 API_PID=$!
 
