@@ -30,6 +30,7 @@ cp .env.example .env
 - `SUPABASE_SERVICE_ROLE_KEY`（**バックエンド専用。フロントエンドへ絶対に露出しないこと**）
 - `DATABASE_URL`（Supabase Postgres 接続文字列。Alembic / SQLAlchemy が利用）
   - 推奨形式: `postgresql+psycopg://USER:PASSWORD@HOST:PORT/DBNAME`
+  - **必須**: 未設定時はアプリ/マイグレーションは起動せず `RuntimeError` で停止します（localhostへのフォールバックはしません）。
 
 ### DATABASE_URL の取得方法（Supabase Dashboard）
 
