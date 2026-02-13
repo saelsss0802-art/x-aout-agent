@@ -45,6 +45,9 @@ def test_run_all_agents_runs_only_active_and_continues_on_error(monkeypatch) -> 
             "target_date": base_date,
             "log_path": f"apps/worker/logs/{agent_id}/{base_date.isoformat()}.json",
             "posts": 0,
+            "status": "success",
+            "budget_status": {"daily_limit": "300", "total_spent": "3.00"},
+            "rate_status": {"total_used": 0, "daily_total_limit": 3},
         }
 
     monkeypatch.setattr(scheduler, "run_daily_routine", fake_run_daily_routine)
@@ -54,6 +57,8 @@ def test_run_all_agents_runs_only_active_and_continues_on_error(monkeypatch) -> 
     assert called == [1, 2]
     assert [r["agent_id"] for r in results] == [1, 2]
     assert results[0]["status"] == "success"
+    assert results[0]["budget_status"] is not None
+    assert results[0]["rate_status"] is not None
     assert results[1]["status"] == "failed"
 
     with Session(engine) as session:

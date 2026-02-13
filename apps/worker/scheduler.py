@@ -14,7 +14,7 @@ from sqlalchemy import select
 from core.db import Base, SessionLocal, engine
 from core.models import Agent, AgentStatus, DailyPDCA
 
-from .daily_routine import BudgetExceededError, run_daily_routine
+from .daily_routine import run_daily_routine
 
 
 def _require_database_url() -> None:
@@ -78,21 +78,13 @@ def run_all_agents(base_date: date | None = None) -> list[dict[str, Any]]:
             result = run_daily_routine(agent_id=agent_id, base_date=run_date)
             status_payload = {
                 "event": "agent_daily_routine",
-                "status": "success",
+                "status": result.get("status", "success"),
+                "reason": result.get("reason"),
                 "agent_id": agent_id,
                 "target_date": result["target_date"].isoformat(),
-                "log_path": str(result["log_path"]),
-            }
-        except BudgetExceededError as exc:
-            error_payload = {"type": type(exc).__name__, "message": str(exc)}
-            log_path = _write_error_log(agent_id=agent_id, target_date=target_date, error_payload=error_payload)
-            status_payload = {
-                "event": "agent_daily_routine",
-                "status": "skip",
-                "reason": "skipped_budget",
-                "agent_id": agent_id,
-                "target_date": target_date.isoformat(),
-                "log_path": str(log_path),
+                "log_path": str(result["log_path"]) if result.get("log_path") else None,
+                "budget_status": result.get("budget_status"),
+                "rate_status": result.get("rate_status"),
             }
         except Exception as exc:  # noqa: BLE001
             error_payload = {"type": type(exc).__name__, "message": str(exc)}

@@ -9,34 +9,20 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from core import ExternalPost, ExternalPostMetrics, XClient
+from core import BudgetExceededError, BudgetLedger, ExternalPost, ExternalPostMetrics, RateLimiter, XClient
 from core.db import Base, SessionLocal, engine
 from core.models import (
+    ActionType,
     Account,
     AccountType,
     Agent,
     AgentStatus,
-    CostLog,
     DailyPDCA,
     MetricsCollectionType,
     Post,
     PostMetrics,
     PostType,
 )
-
-
-class BudgetExceededError(RuntimeError):
-    pass
-
-
-class BudgetGuard:
-    def __init__(self, budget_limit: int, spent: Decimal) -> None:
-        self.budget_limit = Decimal(budget_limit)
-        self.spent = spent
-
-    def ensure_within_budget(self, next_cost: Decimal) -> None:
-        if self.spent + next_cost > self.budget_limit:
-            raise BudgetExceededError("Daily budget exceeded")
 
 
 class FakeXClient:
@@ -167,11 +153,75 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
         agent = _ensure_agent(session, agent_id)
         x_cost = Decimal("1.00")
         llm_cost = Decimal("2.00")
-        total_cost = x_cost + llm_cost
-        spent_today = session.scalar(
-            select(CostLog.total).where(CostLog.agent_id == agent_id, CostLog.date == target_date)
-        ) or Decimal("0")
-        BudgetGuard(agent.daily_budget, Decimal(spent_today)).ensure_within_budget(total_cost)
+        ledger = BudgetLedger(
+            session,
+            agent_id=agent_id,
+            target_date=target_date,
+            daily_budget=agent.daily_budget,
+            split_x=agent.budget_split_x,
+            split_llm=agent.budget_split_llm,
+        )
+        rate_limiter = RateLimiter(session, agent_id=agent_id, target_date=target_date, daily_total_limit=3)
+
+        if rate_limiter.is_limited(action_type=ActionType.reply, requested=1):
+            rate_status = rate_limiter.status(action_type=ActionType.reply)
+            budget_status = ledger.status()
+            pdca = session.scalar(
+                select(DailyPDCA).where(DailyPDCA.agent_id == agent_id, DailyPDCA.date == target_date)
+            )
+            if pdca is None:
+                pdca = DailyPDCA(
+                    agent_id=agent_id,
+                    date=target_date,
+                    analytics_summary={"status": "skip", "reason": "rate_limited"},
+                    analysis={"status": "skipped", "reason": "rate_limited"},
+                    strategy={"next_action": "wait"},
+                    posts_created=[],
+                )
+                session.add(pdca)
+            session.commit()
+            return {
+                "target_date": target_date,
+                "log_path": None,
+                "posts": 0,
+                "status": "skip",
+                "reason": "rate_limited",
+                "budget_status": {"total_spent": str(budget_status.total_spent), "daily_limit": str(budget_status.daily_limit)},
+                "rate_status": rate_status,
+            }
+
+        try:
+            ledger.reserve(x_cost=x_cost, llm_cost=llm_cost)
+        except BudgetExceededError:
+            rate_status = rate_limiter.status(action_type=ActionType.reply)
+            budget_status = ledger.status()
+            pdca = session.scalar(
+                select(DailyPDCA).where(DailyPDCA.agent_id == agent_id, DailyPDCA.date == target_date)
+            )
+            if pdca is None:
+                pdca = DailyPDCA(
+                    agent_id=agent_id,
+                    date=target_date,
+                    analytics_summary={"status": "skip", "reason": "budget_exceeded"},
+                    analysis={"status": "skipped", "reason": "budget_exceeded"},
+                    strategy={"next_action": "wait"},
+                    posts_created=[],
+                )
+                session.add(pdca)
+            session.commit()
+            return {
+                "target_date": target_date,
+                "log_path": None,
+                "posts": 0,
+                "status": "skip",
+                "reason": "budget_exceeded",
+                "budget_status": {
+                    "total_spent": str(budget_status.total_spent),
+                    "daily_limit": str(budget_status.daily_limit),
+                    "reserved_total": str(budget_status.total_reserved),
+                },
+                "rate_status": rate_status,
+            }
 
         external_posts = x_client.list_posts(agent_id=agent_id, target_date=target_date)
         inserted_metrics = 0
@@ -206,22 +256,10 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
         else:
             pdca.analytics_summary = analytics_summary
 
-        cost = session.scalar(select(CostLog).where(CostLog.agent_id == agent_id, CostLog.date == target_date))
-        if cost is None:
-            cost = CostLog(
-                agent_id=agent_id,
-                date=target_date,
-                x_api_cost=x_cost,
-                llm_cost=llm_cost,
-                image_gen_cost=Decimal("0"),
-                total=total_cost,
-            )
-            session.add(cost)
-        else:
-            cost.x_api_cost = x_cost
-            cost.llm_cost = llm_cost
-            cost.image_gen_cost = Decimal("0")
-            cost.total = total_cost
+        ledger.commit()
+
+        budget_status = ledger.status()
+        rate_status = rate_limiter.status(action_type=ActionType.reply)
 
         session.commit()
 
@@ -232,11 +270,21 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
         "posts": post_ids,
         "metrics": metric_rows,
         "confirmed_metrics_created": inserted_metrics,
-        "cost": {"x_api_cost": str(x_cost), "llm_cost": str(llm_cost), "total": str(total_cost)},
+        "cost": {"x_api_cost": str(x_cost), "llm_cost": str(llm_cost), "total": str(x_cost + llm_cost)},
     }
     log_dir = Path("apps/worker/logs") / str(agent_id)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{target_date.isoformat()}.json"
     log_path.write_text(json.dumps(log_payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
-    return {"target_date": target_date, "log_path": log_path, "posts": len(post_ids)}
+    return {
+        "target_date": target_date,
+        "log_path": log_path,
+        "posts": len(post_ids),
+        "status": "success",
+        "budget_status": {
+            "total_spent": str(budget_status.total_spent),
+            "daily_limit": str(budget_status.daily_limit),
+        },
+        "rate_status": rate_status,
+    }
