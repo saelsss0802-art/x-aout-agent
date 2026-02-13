@@ -130,10 +130,14 @@ class TargetAccount(Base):
 
 class Post(Base):
     __tablename__ = "posts"
-    __table_args__ = (Index("ix_posts_posted_at", "posted_at"),)
+    __table_args__ = (
+        Index("ix_posts_posted_at", "posted_at"),
+        UniqueConstraint("agent_id", "external_id", name="uq_posts_agent_external_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id"), nullable=False, index=True)
+    external_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     type: Mapped[PostType] = mapped_column(
         Enum(PostType, name="post_type_enum", validate_strings=True), nullable=False
