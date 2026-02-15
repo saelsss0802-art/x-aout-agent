@@ -7,7 +7,7 @@ from decimal import Decimal
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .models import ActionType, CostLog, EngagementAction
+from .models import ActionType, CostLog, EngagementAction, SearchLog
 
 
 class BudgetExceededError(RuntimeError):
@@ -109,6 +109,49 @@ class BudgetLedger:
             x_limit=self.x_limit,
             llm_limit=self.llm_limit,
         )
+
+
+class SearchLimiter:
+    def __init__(
+        self,
+        session: Session,
+        *,
+        agent_id: int,
+        target_date: date,
+        x_search_max: int = 10,
+        web_search_max: int = 10,
+    ) -> None:
+        self.session = session
+        self.agent_id = agent_id
+        self.target_date = target_date
+        self.x_search_max = x_search_max
+        self.web_search_max = web_search_max
+
+    def _count(self, *, source: str) -> int:
+        return int(
+            self.session.scalar(
+                select(func.count(SearchLog.id)).where(
+                    SearchLog.agent_id == self.agent_id,
+                    SearchLog.date == self.target_date,
+                    SearchLog.source == source,
+                )
+            )
+            or 0
+        )
+
+    def is_limited(self, *, source: str, requested: int = 1) -> bool:
+        source_max = self.x_search_max if source == "x" else self.web_search_max
+        return self._count(source=source) + requested > source_max
+
+    def status(self, *, source: str) -> dict[str, int | str]:
+        source_max = self.x_search_max if source == "x" else self.web_search_max
+        used = self._count(source=source)
+        return {
+            "source": source,
+            "daily_limit": source_max,
+            "used": used,
+            "remaining": max(0, source_max - used),
+        }
 
 
 class RateLimiter:
