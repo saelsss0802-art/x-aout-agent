@@ -50,6 +50,26 @@ DATABASE_URL=postgresql+psycopg://USER:PASSWORD@HOST:PORT/DBNAME
 
 Supabase の pooler を使う場合も同じ形式で、HOST/PORT を Connect タブで示される pooler の値に置き換えてください。
 
+
+## X API v2 integration
+
+Set `USE_REAL_X=1` to use X API v2 instead of `FakeXClient` in the worker routine.
+
+Required and recommended variables:
+
+- `X_BEARER_TOKEN` (required when `USE_REAL_X=1`)
+- `X_USER_ID` (recommended; required when `/2/users/me` cannot be used in your auth context)
+- `USE_REAL_X=1`
+
+Usage API (`GET /2/usage/tweets`) can be enabled with:
+
+- `USE_X_USAGE=1`
+- `X_UNIT_PRICE` (optional per-unit price for local cost conversion)
+
+X API v2 is pay-per-usage and endpoint unit prices are configured in the Developer Console. This project stores usage units (`x_usage_units`) and raw usage payload (`x_usage_raw`) in `CostLog`, then optionally converts units to `x_api_cost` via `X_UNIT_PRICE`.
+
+X API related worker tests use httpx mocks and require the httpx package to be installed in the test environment.
+
 ## 起動方法（Docker なし）
 
 ```bash

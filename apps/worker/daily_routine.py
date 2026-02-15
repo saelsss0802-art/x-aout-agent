@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -9,7 +10,7 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from core import BudgetExceededError, BudgetLedger, ExternalPost, ExternalPostMetrics, RateLimiter, XClient
+from core import BudgetExceededError, BudgetLedger, ExternalPost, ExternalPostMetrics, RateLimiter, XClient, XUsage
 from core.db import Base, SessionLocal, engine
 from core.models import (
     ActionType,
@@ -17,6 +18,7 @@ from core.models import (
     AccountType,
     Agent,
     AgentStatus,
+    CostLog,
     DailyPDCA,
     MetricsCollectionType,
     Post,
@@ -24,8 +26,23 @@ from core.models import (
     PostType,
 )
 
+try:
+    from .real_x_client import MissingXUserIdError, RealXClient, XApiError
+except ModuleNotFoundError:
+    class XApiError(RuntimeError):
+        pass
+
+    class MissingXUserIdError(XApiError):
+        pass
+
+    RealXClient = None  # type: ignore[assignment]
+
 
 class FakeXClient:
+    def resolve_user_id(self, handle_or_me: str = "me") -> str:
+        del handle_or_me
+        return "fake-user-id"
+
     def list_posts(self, agent_id: int, target_date: date) -> list[ExternalPost]:
         base = datetime(target_date.year, target_date.month, target_date.day, 9, tzinfo=timezone.utc)
         return [
@@ -65,6 +82,26 @@ class FakeXClient:
             retweets=retweets,
             clicks=clicks,
         )
+
+    def get_daily_usage(self, usage_date: date) -> XUsage:
+        return XUsage(usage_date=usage_date, units=0, raw={"source": "fake"})
+
+
+def _build_x_client(account: Account | None = None) -> XClient:
+    if os.getenv("USE_REAL_X") == "1":
+        token = os.getenv("X_BEARER_TOKEN")
+        if not token:
+            raise XApiError("X_BEARER_TOKEN is required when USE_REAL_X=1")
+        account_user_id = None
+        if account and isinstance(account.api_keys, dict):
+            raw = account.api_keys.get("x_user_id")
+            if isinstance(raw, str):
+                account_user_id = raw
+        user_id = os.getenv("X_USER_ID") or account_user_id
+        if RealXClient is None:
+            raise XApiError("httpx is required when USE_REAL_X=1")
+        return RealXClient(bearer_token=token, user_id=user_id)
+    return FakeXClient()
 
 
 def _ensure_agent(session: Session, agent_id: int) -> Agent:
@@ -142,15 +179,51 @@ def _save_confirmed_metrics(
     return True
 
 
+def _apply_usage(session: Session, *, agent_id: int, usage_date: date, x_client: XClient) -> bool:
+    if os.getenv("USE_X_USAGE") != "1":
+        return True
+
+    usage = x_client.get_daily_usage(usage_date=usage_date)
+    cost_log = session.scalar(select(CostLog).where(CostLog.agent_id == agent_id, CostLog.date == usage_date))
+    if cost_log is None:
+        cost_log = CostLog(
+            agent_id=agent_id,
+            date=usage_date,
+            x_api_cost=Decimal("0"),
+            llm_cost=Decimal("0"),
+            image_gen_cost=Decimal("0"),
+            total=Decimal("0"),
+        )
+        session.add(cost_log)
+    cost_log.x_usage_units = usage.units
+    cost_log.x_usage_raw = usage.raw
+
+    unit_price = Decimal(os.getenv("X_UNIT_PRICE", "0"))
+    if unit_price > 0:
+        measured_x_cost = Decimal(usage.units) * unit_price
+        cost_log.x_api_cost = measured_x_cost.quantize(Decimal("0.01"))
+        cost_log.total = Decimal(cost_log.x_api_cost) + Decimal(cost_log.llm_cost) + Decimal(cost_log.image_gen_cost)
+    return True
+
+
+
+
+def _write_daily_log(agent_id: int, target_date: date, payload: dict[str, object]) -> Path:
+    log_dir = Path("apps/worker/logs") / str(agent_id)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{target_date.isoformat()}.json"
+    log_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    return log_path
+
+
 def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None = None) -> dict[str, object]:
     target_date = base_date - timedelta(days=2)
     now = datetime.now(timezone.utc).replace(microsecond=0)
-    x_client = x_client or FakeXClient()
-
     Base.metadata.create_all(bind=engine)
 
     with SessionLocal() as session:
         agent = _ensure_agent(session, agent_id)
+        x_client = x_client or _build_x_client(agent.account)
         x_cost = Decimal("1.00")
         llm_cost = Decimal("2.00")
         ledger = BudgetLedger(
@@ -223,15 +296,63 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
                 "rate_status": rate_status,
             }
 
-        external_posts = x_client.list_posts(agent_id=agent_id, target_date=target_date)
+        try:
+            external_posts = x_client.list_posts(agent_id=agent_id, target_date=target_date)
+        except MissingXUserIdError as exc:
+            rate_status = rate_limiter.status(action_type=ActionType.reply)
+            budget_status = ledger.status()
+            pdca = session.scalar(
+                select(DailyPDCA).where(DailyPDCA.agent_id == agent_id, DailyPDCA.date == target_date)
+            )
+            if pdca is None:
+                pdca = DailyPDCA(
+                    agent_id=agent_id,
+                    date=target_date,
+                    analytics_summary={"status": "skip", "reason": "missing_user_id", "message": str(exc)},
+                    analysis={"status": "skipped", "reason": "missing_user_id"},
+                    strategy={"next_action": "set_x_user_id"},
+                    posts_created=[],
+                )
+                session.add(pdca)
+            else:
+                pdca.analytics_summary = {"status": "skip", "reason": "missing_user_id", "message": str(exc)}
+                pdca.analysis = {"status": "skipped", "reason": "missing_user_id"}
+                pdca.strategy = {"next_action": "set_x_user_id"}
+                pdca.posts_created = []
+            session.commit()
+            log_path = _write_daily_log(
+                agent_id,
+                target_date,
+                {
+                    "agent_id": agent_id,
+                    "base_date": base_date.isoformat(),
+                    "target_date": target_date.isoformat(),
+                    "status": "skip",
+                    "reason": "missing_user_id",
+                    "message": str(exc),
+                },
+            )
+            return {
+                "target_date": target_date,
+                "log_path": log_path,
+                "posts": 0,
+                "status": "skip",
+                "reason": "missing_user_id",
+                "budget_status": {"total_spent": str(budget_status.total_spent), "daily_limit": str(budget_status.daily_limit)},
+                "rate_status": rate_status,
+            }
+
         inserted_metrics = 0
         metric_rows: list[dict[str, object]] = []
         post_ids: list[int] = []
+        impressions_unavailable = False
 
         for external_post in external_posts:
             post = _upsert_post(session, agent_id, external_post)
             post_ids.append(post.id)
             external_metrics = x_client.get_post_metrics(external_post)
+            if external_metrics.impressions_unavailable:
+                impressions_unavailable = True
             created = _save_confirmed_metrics(session, post, external_metrics, now)
             if created:
                 inserted_metrics += 1
@@ -242,6 +363,7 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
             "target_date": target_date.isoformat(),
             "post_count": len(external_posts),
             "confirmed_metrics_created": inserted_metrics,
+            "impressions_unavailable": impressions_unavailable,
         }
         if pdca is None:
             pdca = DailyPDCA(
@@ -258,6 +380,15 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
 
         ledger.commit()
 
+        usage_fetch_failed = False
+        try:
+            _apply_usage(session, agent_id=agent_id, usage_date=target_date, x_client=x_client)
+        except (XApiError, ValueError):
+            usage_fetch_failed = True
+
+        if usage_fetch_failed:
+            pdca.analysis = {**pdca.analysis, "usage_fetch_failed": True}
+
         budget_status = ledger.status()
         rate_status = rate_limiter.status(action_type=ActionType.reply)
 
@@ -267,15 +398,13 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
         "agent_id": agent_id,
         "base_date": base_date.isoformat(),
         "target_date": target_date.isoformat(),
+        "status": "success",
         "posts": post_ids,
         "metrics": metric_rows,
         "confirmed_metrics_created": inserted_metrics,
         "cost": {"x_api_cost": str(x_cost), "llm_cost": str(llm_cost), "total": str(x_cost + llm_cost)},
     }
-    log_dir = Path("apps/worker/logs") / str(agent_id)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"{target_date.isoformat()}.json"
-    log_path.write_text(json.dumps(log_payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    log_path = _write_daily_log(agent_id, target_date, log_payload)
 
     return {
         "target_date": target_date,
