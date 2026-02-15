@@ -24,9 +24,21 @@ class ExternalPostMetrics:
     replies: int = 0
     retweets: int = 0
     clicks: int = 0
+    impressions_unavailable: bool = False
+
+
+@dataclass(frozen=True)
+class XUsage:
+    usage_date: date
+    units: int
+    raw: dict[str, object] = field(default_factory=dict)
 
 
 class XClient(Protocol):
+    def resolve_user_id(self, handle_or_me: str = "me") -> str: ...
+
     def list_posts(self, agent_id: int, target_date: date) -> list[ExternalPost]: ...
 
     def get_post_metrics(self, external_post: ExternalPost) -> ExternalPostMetrics: ...
+
+    def get_daily_usage(self, usage_date: date) -> XUsage: ...

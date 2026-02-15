@@ -276,6 +276,8 @@ class CostLog(Base):
         Numeric(12, 2), nullable=False, default=0, server_default="0"
     )
     total: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
+    x_usage_units: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    x_usage_raw: Mapped[dict[str, Any]] = mapped_column(JSONType, nullable=False, default=dict)
 
 
 class Heartbeat(Base):
