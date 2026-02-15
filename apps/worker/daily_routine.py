@@ -4,6 +4,7 @@ import json
 import os
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 from pathlib import Path
 
@@ -85,6 +86,81 @@ class FakeXClient:
 
     def get_daily_usage(self, usage_date: date) -> XUsage:
         return XUsage(usage_date=usage_date, units=0, raw={"source": "fake"})
+
+
+def _posts_per_day(agent: Agent) -> int:
+    env_value = os.getenv("POSTS_PER_DAY")
+    if env_value is not None:
+        try:
+            return max(0, int(env_value))
+        except ValueError:
+            return 1
+    toggles = agent.feature_toggles if isinstance(agent.feature_toggles, dict) else {}
+    value = toggles.get("posts_per_day", 1)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _scheduled_datetime_for_plan(target_date: date) -> datetime:
+    tz = ZoneInfo(os.getenv("WORKER_TZ", "UTC"))
+    hour = int(os.getenv("POST_HOUR", "9"))
+    minute = int(os.getenv("POST_MINUTE", "0"))
+    next_date = target_date + timedelta(days=1)
+    return datetime(next_date.year, next_date.month, next_date.day, hour, minute, tzinfo=tz)
+
+
+def _generate_planned_content(agent_id: int, scheduled_at: datetime, index: int) -> str:
+    return f"Daily note agent={agent_id} slot={index + 1} at {scheduled_at.isoformat()}"
+
+
+def _create_next_day_posts(
+    session: Session,
+    *,
+    agent: Agent,
+    target_date: date,
+    pdca: DailyPDCA,
+    ledger: BudgetLedger,
+) -> list[dict[str, object]]:
+    planned_count = _posts_per_day(agent)
+    if planned_count <= 0:
+        return []
+
+    scheduled_at = _scheduled_datetime_for_plan(target_date)
+    scheduled_start = datetime(scheduled_at.year, scheduled_at.month, scheduled_at.day, 0, 0, tzinfo=scheduled_at.tzinfo)
+    scheduled_end = scheduled_start + timedelta(days=1)
+    existing = session.scalars(
+        select(Post).where(
+            Post.agent_id == agent.id,
+            Post.scheduled_at.is_not(None),
+            Post.scheduled_at >= scheduled_start,
+            Post.scheduled_at < scheduled_end,
+            Post.posted_at.is_(None),
+        )
+    ).all()
+    missing = max(0, planned_count - len(existing))
+
+    created: list[dict[str, object]] = []
+    for idx in range(missing):
+        ledger.reserve(x_cost=Decimal("0.00"), llm_cost=Decimal("0.50"))
+        content = _generate_planned_content(agent.id, scheduled_at, len(existing) + idx)
+        post = Post(
+            agent_id=agent.id,
+            content=content,
+            type=PostType.tweet,
+            media_urls=[],
+            scheduled_at=scheduled_at + timedelta(minutes=5 * (len(existing) + idx)),
+            posted_at=None,
+        )
+        session.add(post)
+        session.flush()
+        created.append({"id": post.id, "scheduled_at": post.scheduled_at.isoformat(), "type": post.type.value})
+
+    posts_created = list(pdca.posts_created or [])
+    posts_created.extend(created)
+    pdca.posts_created = posts_created
+    return created
 
 
 def _build_x_client(account: Account | None = None) -> XClient:
@@ -378,6 +454,14 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
         else:
             pdca.analytics_summary = analytics_summary
 
+        planned_posts = _create_next_day_posts(
+            session,
+            agent=agent,
+            target_date=target_date,
+            pdca=pdca,
+            ledger=ledger,
+        )
+
         ledger.commit()
 
         usage_fetch_failed = False
@@ -403,6 +487,7 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
         "metrics": metric_rows,
         "confirmed_metrics_created": inserted_metrics,
         "cost": {"x_api_cost": str(x_cost), "llm_cost": str(llm_cost), "total": str(x_cost + llm_cost)},
+        "planned_posts": planned_posts,
     }
     log_path = _write_daily_log(agent_id, target_date, log_payload)
 

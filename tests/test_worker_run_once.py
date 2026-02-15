@@ -59,7 +59,7 @@ def test_run_once_creates_daily_artifacts(tmp_path: Path) -> None:
         pdca = session.scalars(select(DailyPDCA).where(DailyPDCA.agent_id == 11)).all()
         cost_logs = session.scalars(select(CostLog).where(CostLog.agent_id == 11)).all()
 
-    assert len(posts) == 3
+    assert len(posts) == 4
     assert len(metrics) == 3
     assert len(pdca) == 1
     assert len(cost_logs) == 1
@@ -89,7 +89,7 @@ def test_run_once_is_idempotent_for_confirmed_metrics(tmp_path: Path) -> None:
             select(PostMetrics).where(PostMetrics.collection_type == MetricsCollectionType.confirmed)
         ).all()
 
-    assert len(posts) == 3
+    assert len(posts) == 4
     assert len(metrics) == 3
 
 
