@@ -7,7 +7,7 @@ from decimal import Decimal
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .models import ActionType, CostLog, EngagementAction, SearchLog
+from .models import ActionType, CostLog, EngagementAction, FetchLog, SearchLog
 
 
 class BudgetExceededError(RuntimeError):
@@ -151,6 +151,38 @@ class SearchLimiter:
             "daily_limit": source_max,
             "used": used,
             "remaining": max(0, source_max - used),
+        }
+
+
+class FetchLimiter:
+    def __init__(self, session: Session, *, agent_id: int, target_date: date, web_fetch_max: int = 3) -> None:
+        self.session = session
+        self.agent_id = agent_id
+        self.target_date = target_date
+        self.web_fetch_max = web_fetch_max
+
+    def _count(self) -> int:
+        return int(
+            self.session.scalar(
+                select(func.count(FetchLog.id)).where(
+                    FetchLog.agent_id == self.agent_id,
+                    FetchLog.date == self.target_date,
+                    FetchLog.status.in_(["succeeded", "failed"]),
+                )
+            )
+            or 0
+        )
+
+    def is_limited(self, *, requested: int = 1) -> bool:
+        return self._count() + requested > self.web_fetch_max
+
+    def status(self) -> dict[str, int | str]:
+        used = self._count()
+        return {
+            "source": "web_fetch",
+            "daily_limit": self.web_fetch_max,
+            "used": used,
+            "remaining": max(0, self.web_fetch_max - used),
         }
 
 

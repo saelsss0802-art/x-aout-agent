@@ -12,7 +12,17 @@ from typing import Protocol
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from core import BudgetExceededError, BudgetLedger, ExternalPost, ExternalPostMetrics, RateLimiter, SearchLimiter, XClient, XUsage
+from core import (
+    BudgetExceededError,
+    BudgetLedger,
+    ExternalPost,
+    ExternalPostMetrics,
+    FetchLimiter,
+    RateLimiter,
+    SearchLimiter,
+    XClient,
+    XUsage,
+)
 from core.db import Base, SessionLocal, engine
 from core.models import (
     ActionType,
@@ -22,6 +32,7 @@ from core.models import (
     AgentStatus,
     CostLog,
     DailyPDCA,
+    FetchLog,
     MetricsCollectionType,
     Post,
     PostMetrics,
@@ -29,6 +40,8 @@ from core.models import (
     SearchLog,
 )
 from .gemini_web_search_client import GeminiWebSearchClient, GeminiWebSearchError
+from .summarize import GeminiSummarizeError, GeminiSummarizer
+from .web_fetch_client import WebFetchClient
 
 try:
     from .real_x_client import MissingXUserIdError, RealXClient, XApiError
@@ -497,6 +510,156 @@ def _run_daily_research(
     return {"records": records, "skipped": skipped}
 
 
+
+def _query_needs_fetch(query: str) -> bool:
+    keywords = ("方法", "手順", "比較", "料金", "変更")
+    return any(keyword in query for keyword in keywords)
+
+
+def _snippet_is_ambiguous(snippet: str) -> bool:
+    cleaned = snippet.strip()
+    if len(cleaned) < 60:
+        return True
+    return "..." in cleaned or "詳細" in cleaned
+
+
+def _run_fetch_and_summary(
+    session: Session,
+    *,
+    agent_id: int,
+    target_date: date,
+    ledger: BudgetLedger,
+    search_records: list[dict[str, object]],
+) -> dict[str, object]:
+    fetch_limiter = FetchLimiter(
+        session,
+        agent_id=agent_id,
+        target_date=target_date,
+        web_fetch_max=int(os.getenv("WEB_FETCH_MAX", "3")),
+    )
+    fetch_cost = Decimal(os.getenv("WEB_FETCH_LLM_COST", "0.30"))
+    summarize_cost = Decimal(os.getenv("WEB_SUMMARIZE_LLM_COST", "1.00"))
+    fetch_client = WebFetchClient()
+
+    summarize_enabled = os.getenv("USE_GEMINI_SUMMARIZE", "1") == "1"
+    summarizer: GeminiSummarizer | None = None
+    if summarize_enabled:
+        try:
+            summarizer = GeminiSummarizer()
+        except GeminiSummarizeError:
+            summarizer = None
+
+    processed = 0
+    summarized = 0
+    failed = 0
+    skipped: list[dict[str, str]] = []
+    logs: list[dict[str, object]] = []
+
+    for record in search_records:
+        if record.get("source") != "web":
+            continue
+        query = str(record.get("query", ""))
+        results = record.get("results")
+        if not isinstance(results, list):
+            continue
+        need_fetch = _query_needs_fetch(query)
+        if not need_fetch and any(isinstance(item, dict) and _snippet_is_ambiguous(str(item.get("snippet", ""))) for item in results):
+            need_fetch = True
+        if not need_fetch:
+            continue
+
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url", "")).strip()
+            if not url:
+                continue
+
+            if fetch_limiter.is_limited():
+                skipped.append({"url": url, "reason": "fetch_limit_reached"})
+                session.add(
+                    FetchLog(
+                        agent_id=agent_id,
+                        date=target_date,
+                        url=url,
+                        status="skipped",
+                        failure_reason="fetch_limit_reached",
+                        cost_estimate=Decimal("0"),
+                    )
+                )
+                break
+
+            try:
+                ledger.reserve(x_cost=Decimal("0"), llm_cost=fetch_cost)
+            except BudgetExceededError:
+                skipped.append({"url": url, "reason": "fetch_budget_exceeded"})
+                session.add(
+                    FetchLog(
+                        agent_id=agent_id,
+                        date=target_date,
+                        url=url,
+                        status="skipped",
+                        failure_reason="fetch_budget_exceeded",
+                        cost_estimate=Decimal("0"),
+                    )
+                )
+                break
+
+            fetch_result = fetch_client.fetch(url)
+            summary_payload: dict[str, object] | None = None
+            status = fetch_result.status
+            reason = fetch_result.failure_reason
+            cost_estimate = fetch_cost
+
+            if fetch_result.status == "succeeded" and fetch_result.extracted_text and summarizer is not None:
+                try:
+                    ledger.reserve(x_cost=Decimal("0"), llm_cost=summarize_cost)
+                    summary_payload = summarizer.summarize(fetch_result.extracted_text)
+                    summarized += 1
+                    cost_estimate += summarize_cost
+                except (GeminiSummarizeError, ValueError, RuntimeError, BudgetExceededError) as exc:
+                    status = "failed"
+                    reason = f"summarize_failed:{exc}"
+
+            if status == "failed":
+                failed += 1
+
+            session.add(
+                FetchLog(
+                    agent_id=agent_id,
+                    date=target_date,
+                    url=fetch_result.url,
+                    status=status,
+                    http_status=fetch_result.http_status,
+                    content_type=fetch_result.content_type,
+                    content_length=fetch_result.content_length,
+                    extracted_text=fetch_result.extracted_text,
+                    summary_json=summary_payload,
+                    failure_reason=reason,
+                    cost_estimate=cost_estimate if status == "succeeded" else Decimal("0"),
+                )
+            )
+            logs.append(
+                {
+                    "url": fetch_result.url,
+                    "status": status,
+                    "http_status": fetch_result.http_status,
+                    "summary_safe_to_use": summary_payload.get("safe_to_use") if isinstance(summary_payload, dict) else None,
+                    "reason": reason,
+                }
+            )
+            processed += 1
+            break
+
+    return {
+        "fetch_count": processed,
+        "summarize_count": summarized,
+        "failed_count": failed,
+        "skipped": skipped,
+        "logs": logs,
+    }
+
+
 def _write_daily_log(agent_id: int, target_date: date, payload: dict[str, object]) -> Path:
     log_dir = Path("apps/worker/logs") / str(agent_id)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -682,6 +845,21 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
             web_client=web_search_client,
             x_search_client=x_search_client,
         )
+        fetch_summary = _run_fetch_and_summary(
+            session,
+            agent_id=agent_id,
+            target_date=target_date,
+            ledger=ledger,
+            search_records=research_summary["records"],
+        )
+        analytics = dict(pdca.analytics_summary or {})
+        analytics["fetch"] = {
+            "fetch_count": fetch_summary["fetch_count"],
+            "summarize_count": fetch_summary["summarize_count"],
+            "failed_count": fetch_summary["failed_count"],
+            "skipped": fetch_summary["skipped"],
+        }
+        pdca.analytics_summary = analytics
 
         planned_posts = _create_next_day_posts(
             session,
@@ -718,6 +896,7 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
         "cost": {"x_api_cost": str(x_cost), "llm_cost": str(llm_cost), "total": str(x_cost + llm_cost)},
         "planned_posts": planned_posts,
         "research": research_summary,
+        "fetch": fetch_summary,
     }
     log_path = _write_daily_log(agent_id, target_date, log_payload)
 
