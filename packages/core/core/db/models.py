@@ -296,6 +296,27 @@ class SearchLog(Base):
     )
 
 
+class FetchLog(Base):
+    __tablename__ = "fetch_logs"
+    __table_args__ = (Index("ix_fetch_logs_date", "date"), Index("ix_fetch_logs_date_status", "date", "status"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id"), nullable=False, index=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False)
+    url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    content_length: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    extracted_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    summary_json: Mapped[dict[str, Any] | None] = mapped_column(JSONType, nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cost_estimate: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class Heartbeat(Base):
     __tablename__ = "heartbeat"
 
