@@ -58,6 +58,23 @@ class RealXClient:
             return {}
         return payload
 
+    def _post_json(self, path: str, body: dict[str, object]) -> dict[str, object]:
+        try:
+            response = self._http_client.post(
+                f"{self._base_url}/{path.lstrip('/')}",
+                headers=self._headers(),
+                json=body,
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise XApiError(f"X API request failed: {path} status={exc.response.status_code}") from exc
+        except httpx.RequestError as exc:
+            raise XApiError(f"X API request failed: {path} network_error={exc.__class__.__name__}") from exc
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return {}
+        return payload
+
     def resolve_user_id(self, handle_or_me: str = "me") -> str:
         del handle_or_me
         if self._user_id:
@@ -162,6 +179,13 @@ class RealXClient:
             clicks=clicks,
             impressions_unavailable=impressions_unavailable,
         )
+
+    def post_text(self, text: str) -> str:
+        payload = self._post_json("tweets", {"text": text})
+        data = payload.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("id"), str):
+            raise XApiError("X API post response missing tweet id")
+        return data["id"]
 
     def get_daily_usage(self, usage_date: date) -> XUsage:
         start_time = datetime.combine(usage_date, time.min, tzinfo=timezone.utc)

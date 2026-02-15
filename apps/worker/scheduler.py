@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -15,6 +15,7 @@ from core.db import Base, SessionLocal, engine
 from core.models import Agent, AgentStatus, DailyPDCA
 
 from .daily_routine import run_daily_routine
+from .posting_jobs import run_posting_jobs
 
 
 def _require_database_url() -> None:
@@ -105,6 +106,17 @@ def run_all_agents(base_date: date | None = None) -> list[dict[str, Any]]:
     return results
 
 
+def run_posting_once(base_datetime: datetime | None = None) -> list[dict[str, Any]]:
+    _require_database_url()
+    Base.metadata.create_all(bind=engine)
+    run_dt = base_datetime or datetime.now()
+    results = run_posting_jobs(base_datetime=run_dt)
+    for result in results:
+        payload = {"event": "posting_job", **result}
+        print(json.dumps(payload, ensure_ascii=True))
+    return results
+
+
 def _count_active_agents() -> int:
     with SessionLocal() as session:
         return len(
@@ -120,12 +132,20 @@ def run_scheduler() -> None:
     minute = int(os.getenv("WORKER_DAILY_MINUTE", "0"))
 
     scheduler = BlockingScheduler(timezone=timezone)
+    posting_poll_seconds = int(os.getenv("POSTING_POLL_SECONDS", "300"))
     scheduler.add_job(
         lambda: run_all_agents(base_date=date.today()),
         trigger="cron",
         hour=hour,
         minute=minute,
         id="daily-routine-all-agents",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        lambda: run_posting_once(base_datetime=datetime.now(timezone)),
+        trigger="interval",
+        seconds=posting_poll_seconds,
+        id="posting-jobs",
         replace_existing=True,
     )
 
@@ -138,6 +158,7 @@ def run_scheduler() -> None:
                 "next_run_time": next_run.isoformat() if next_run else None,
                 "active_agent_count": active_count,
                 "timezone": tz_name,
+                "posting_poll_seconds": posting_poll_seconds,
             },
             ensure_ascii=True,
         )
@@ -148,6 +169,7 @@ def run_scheduler() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run daily worker scheduler")
     parser.add_argument("--once", action="store_true", help="Run all active agents once and exit")
+    parser.add_argument("--once-posts", action="store_true", help="Run posting jobs once and exit")
     return parser.parse_args()
 
 
@@ -155,6 +177,9 @@ def main() -> None:
     args = parse_args()
     if args.once:
         run_all_agents(base_date=date.today())
+        return
+    if args.once_posts:
+        run_posting_once(base_datetime=datetime.now())
         return
     run_scheduler()
 
