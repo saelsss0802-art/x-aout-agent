@@ -28,6 +28,7 @@ from core.models import (
     PostType,
     SearchLog,
 )
+from .gemini_web_search_client import GeminiWebSearchClient, GeminiWebSearchError
 
 try:
     from .real_x_client import MissingXUserIdError, RealXClient, XApiError
@@ -344,7 +345,7 @@ def _record_search(
     target_date: date,
     source: str,
     query: str,
-    results: list[dict[str, str]],
+    results: dict[str, object],
     cost_estimate: Decimal,
 ) -> None:
     session.add(
@@ -357,6 +358,47 @@ def _record_search(
             cost_estimate=cost_estimate,
         )
     )
+
+
+def _normalize_search_log_payload(raw_results: object, *, k: int, snippet_limit: int) -> dict[str, object]:
+    top_k = max(1, min(k, 5))
+    payload: dict[str, object] = {"results": [], "citations": [], "notes": {"grounded": False}}
+
+    if isinstance(raw_results, dict):
+        items = raw_results.get("results") if isinstance(raw_results.get("results"), list) else []
+        citations_raw = raw_results.get("citations") if isinstance(raw_results.get("citations"), list) else []
+        notes_raw = raw_results.get("notes") if isinstance(raw_results.get("notes"), dict) else {}
+    elif isinstance(raw_results, list):
+        items = raw_results
+        citations_raw = []
+        notes_raw = {}
+    else:
+        items = []
+        citations_raw = []
+        notes_raw = {}
+
+    normalized_results: list[dict[str, str]] = []
+    for item in items[:top_k]:
+        if not isinstance(item, dict):
+            continue
+        normalized_results.append(
+            {
+                "title": str(item.get("title", "")),
+                "snippet": str(item.get("snippet", ""))[:snippet_limit],
+                "url": str(item.get("url", "")),
+            }
+        )
+
+    citations: list[dict[str, str]] = []
+    for item in citations_raw:
+        if not isinstance(item, dict):
+            continue
+        citations.append({"url": str(item.get("url", "")), "title": str(item.get("title", ""))})
+
+    payload["results"] = normalized_results
+    payload["citations"] = citations
+    payload["notes"] = {"grounded": bool(notes_raw.get("grounded", False))}
+    return payload
 
 
 def _run_daily_research(
@@ -378,7 +420,8 @@ def _run_daily_research(
     )
     k = int(os.getenv("SEARCH_TOP_K", "3"))
     x_search_cost = Decimal(os.getenv("X_SEARCH_COST", "1.00"))
-    web_search_cost = Decimal(os.getenv("WEB_SEARCH_COST", "1.00"))
+    web_search_cost = Decimal(os.getenv("WEB_SEARCH_COST", os.getenv("GEMINI_GROUNDING_UNIT_COST", "1.00")))
+    search_snippet_limit = int(os.getenv("SEARCH_SNIPPET_LIMIT", "300"))
 
     records: list[dict[str, object]] = []
     skipped: list[dict[str, str]] = []
@@ -404,7 +447,7 @@ def _run_daily_research(
                     target_date=target_date,
                     source="x",
                     query=query,
-                    results=normalized,
+                    results=_normalize_search_log_payload(normalized, k=k, snippet_limit=search_snippet_limit),
                     cost_estimate=x_search_cost,
                 )
                 records.append({"source": "x", "query": query, "results": normalized})
@@ -418,24 +461,37 @@ def _run_daily_research(
                 # Web search is tracked inside the LLM budget bucket for unified daily control.
                 ledger.reserve(x_cost=Decimal("0"), llm_cost=web_search_cost)
                 web_results = web_client.search(query, k)
+                raw_payload = (
+                    web_client.last_payload
+                    if hasattr(web_client, "last_payload") and isinstance(web_client.last_payload, dict)
+                    else web_results
+                )
+                normalized_payload = _normalize_search_log_payload(raw_payload, k=k, snippet_limit=search_snippet_limit)
                 _record_search(
                     session,
                     agent_id=agent_id,
                     target_date=target_date,
                     source="web",
                     query=query,
-                    results=web_results,
+                    results=normalized_payload,
                     cost_estimate=web_search_cost,
                 )
+                ledger.commit()
                 records.append({"source": "web", "query": query, "results": web_results})
             except BudgetExceededError:
                 skipped.append({"source": "web", "query": query, "reason": "search_budget_exceeded"})
+            except (GeminiWebSearchError, ValueError, RuntimeError):
+                skipped.append({"source": "web", "query": query, "reason": "gemini_search_failed"})
 
     analytics = dict(pdca.analytics_summary or {})
     analytics["search"] = {
         "count": len(records),
         "last_queries": [item["query"] for item in records[-3:]],
         "skipped": skipped,
+        "usage": {
+            "web_search_provider": "gemini" if os.getenv("USE_GEMINI_WEB_SEARCH") == "1" else "fake",
+            "web_search_status": "ok" if not any(item["reason"] == "gemini_search_failed" for item in skipped) else "failed",
+        },
     }
     pdca.analytics_summary = analytics
     return {"records": records, "skipped": skipped}
@@ -457,7 +513,10 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
     with SessionLocal() as session:
         agent = _ensure_agent(session, agent_id)
         x_client = x_client or _build_x_client(agent.account)
-        web_search_client: WebSearchClient = FakeWebSearchClient()
+        if os.getenv("USE_GEMINI_WEB_SEARCH") == "1":
+            web_search_client = GeminiWebSearchClient()
+        else:
+            web_search_client = FakeWebSearchClient()
         x_search_client: XSearchClient = FakeXSearchClient()
         x_cost = Decimal("1.00")
         llm_cost = Decimal("2.00")
