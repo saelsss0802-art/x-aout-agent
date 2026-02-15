@@ -280,6 +280,22 @@ class CostLog(Base):
     x_usage_raw: Mapped[dict[str, Any]] = mapped_column(JSONType, nullable=False, default=dict)
 
 
+class SearchLog(Base):
+    __tablename__ = "search_logs"
+    __table_args__ = (Index("ix_search_logs_date", "date"), Index("ix_search_logs_date_source", "date", "source"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id"), nullable=False, index=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    query: Mapped[str] = mapped_column(Text, nullable=False)
+    results_json: Mapped[list[dict[str, Any]]] = mapped_column(JSONType, nullable=False, default=list)
+    cost_estimate: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class Heartbeat(Base):
     __tablename__ = "heartbeat"
 

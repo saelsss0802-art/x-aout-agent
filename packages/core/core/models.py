@@ -18,6 +18,7 @@ from .db.models import (
     Post,
     PostMetrics,
     PostType,
+    SearchLog,
     SharedKnowledge,
     TargetAccount,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "Post",
     "PostMetrics",
     "PostType",
+    "SearchLog",
     "SharedKnowledge",
     "TargetAccount",
 ]

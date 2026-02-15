@@ -7,11 +7,12 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from decimal import Decimal
 from pathlib import Path
+from typing import Protocol
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from core import BudgetExceededError, BudgetLedger, ExternalPost, ExternalPostMetrics, RateLimiter, XClient, XUsage
+from core import BudgetExceededError, BudgetLedger, ExternalPost, ExternalPostMetrics, RateLimiter, SearchLimiter, XClient, XUsage
 from core.db import Base, SessionLocal, engine
 from core.models import (
     ActionType,
@@ -25,6 +26,7 @@ from core.models import (
     Post,
     PostMetrics,
     PostType,
+    SearchLog,
 )
 
 try:
@@ -37,6 +39,52 @@ except ModuleNotFoundError:
         pass
 
     RealXClient = None  # type: ignore[assignment]
+
+
+class WebSearchClient(Protocol):
+    def search(self, query: str, k: int) -> list[dict[str, str]]: ...
+
+
+class XSearchClient(Protocol):
+    def search(self, query: str, k: int) -> list[dict[str, str]]: ...
+
+
+class FakeWebSearchClient:
+    def search(self, query: str, k: int) -> list[dict[str, str]]:
+        base = [
+            {
+                "title": "Daily market pulse",
+                "snippet": f"Summary for {query} from trusted web source.",
+                "url": "https://example.com/research/market-pulse",
+            },
+            {
+                "title": "Industry watch",
+                "snippet": f"Signals and context around {query}.",
+                "url": "https://example.com/research/industry-watch",
+            },
+        ]
+        return base[:k]
+
+
+class FakeXSearchClient:
+    def search(self, query: str, k: int) -> list[dict[str, str]]:
+        base = [
+            {
+                "tweet_id": "tweet-001",
+                "author_id": "author-100",
+                "text": f"Conversation spike about {query}",
+                "created_at": "2026-01-01T09:00:00+00:00",
+                "url": "https://x.com/example/status/1",
+            },
+            {
+                "tweet_id": "tweet-002",
+                "author_id": "author-101",
+                "text": f"User sentiment around {query}",
+                "created_at": "2026-01-01T10:00:00+00:00",
+                "url": "https://x.com/example/status/2",
+            },
+        ]
+        return base[:k]
 
 
 class FakeXClient:
@@ -284,6 +332,115 @@ def _apply_usage(session: Session, *, agent_id: int, usage_date: date, x_client:
 
 
 
+def _build_research_queries(agent_id: int, target_date: date) -> list[str]:
+    topic = os.getenv("SEARCH_TOPIC", f"agent-{agent_id}-insights")
+    return [f"{topic} {target_date.isoformat()}"]
+
+
+def _record_search(
+    session: Session,
+    *,
+    agent_id: int,
+    target_date: date,
+    source: str,
+    query: str,
+    results: list[dict[str, str]],
+    cost_estimate: Decimal,
+) -> None:
+    session.add(
+        SearchLog(
+            agent_id=agent_id,
+            date=target_date,
+            source=source,
+            query=query,
+            results_json=results,
+            cost_estimate=cost_estimate,
+        )
+    )
+
+
+def _run_daily_research(
+    session: Session,
+    *,
+    agent_id: int,
+    target_date: date,
+    ledger: BudgetLedger,
+    pdca: DailyPDCA,
+    web_client: WebSearchClient,
+    x_search_client: XSearchClient,
+) -> dict[str, object]:
+    limiter = SearchLimiter(
+        session,
+        agent_id=agent_id,
+        target_date=target_date,
+        x_search_max=int(os.getenv("X_SEARCH_MAX", "10")),
+        web_search_max=int(os.getenv("WEB_SEARCH_MAX", "10")),
+    )
+    k = int(os.getenv("SEARCH_TOP_K", "3"))
+    x_search_cost = Decimal(os.getenv("X_SEARCH_COST", "1.00"))
+    web_search_cost = Decimal(os.getenv("WEB_SEARCH_COST", "1.00"))
+
+    records: list[dict[str, object]] = []
+    skipped: list[dict[str, str]] = []
+
+    for query in _build_research_queries(agent_id, target_date):
+        if limiter.is_limited(source="x"):
+            skipped.append({"source": "x", "query": query, "reason": "search_rate_limited"})
+        else:
+            try:
+                ledger.reserve(x_cost=x_search_cost, llm_cost=Decimal("0"))
+                x_results = x_search_client.search(query, k)
+                normalized = [
+                    {
+                        "title": item.get("text", ""),
+                        "snippet": item.get("text", ""),
+                        "url": item.get("url", ""),
+                    }
+                    for item in x_results
+                ]
+                _record_search(
+                    session,
+                    agent_id=agent_id,
+                    target_date=target_date,
+                    source="x",
+                    query=query,
+                    results=normalized,
+                    cost_estimate=x_search_cost,
+                )
+                records.append({"source": "x", "query": query, "results": normalized})
+            except BudgetExceededError:
+                skipped.append({"source": "x", "query": query, "reason": "search_budget_exceeded"})
+
+        if limiter.is_limited(source="web"):
+            skipped.append({"source": "web", "query": query, "reason": "search_rate_limited"})
+        else:
+            try:
+                # Web search is tracked inside the LLM budget bucket for unified daily control.
+                ledger.reserve(x_cost=Decimal("0"), llm_cost=web_search_cost)
+                web_results = web_client.search(query, k)
+                _record_search(
+                    session,
+                    agent_id=agent_id,
+                    target_date=target_date,
+                    source="web",
+                    query=query,
+                    results=web_results,
+                    cost_estimate=web_search_cost,
+                )
+                records.append({"source": "web", "query": query, "results": web_results})
+            except BudgetExceededError:
+                skipped.append({"source": "web", "query": query, "reason": "search_budget_exceeded"})
+
+    analytics = dict(pdca.analytics_summary or {})
+    analytics["search"] = {
+        "count": len(records),
+        "last_queries": [item["query"] for item in records[-3:]],
+        "skipped": skipped,
+    }
+    pdca.analytics_summary = analytics
+    return {"records": records, "skipped": skipped}
+
+
 def _write_daily_log(agent_id: int, target_date: date, payload: dict[str, object]) -> Path:
     log_dir = Path("apps/worker/logs") / str(agent_id)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -300,6 +457,8 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
     with SessionLocal() as session:
         agent = _ensure_agent(session, agent_id)
         x_client = x_client or _build_x_client(agent.account)
+        web_search_client: WebSearchClient = FakeWebSearchClient()
+        x_search_client: XSearchClient = FakeXSearchClient()
         x_cost = Decimal("1.00")
         llm_cost = Decimal("2.00")
         ledger = BudgetLedger(
@@ -440,6 +599,7 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
             "post_count": len(external_posts),
             "confirmed_metrics_created": inserted_metrics,
             "impressions_unavailable": impressions_unavailable,
+            "search": {"count": 0, "last_queries": [], "skipped": []},
         }
         if pdca is None:
             pdca = DailyPDCA(
@@ -453,6 +613,16 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
             session.add(pdca)
         else:
             pdca.analytics_summary = analytics_summary
+
+        research_summary = _run_daily_research(
+            session,
+            agent_id=agent_id,
+            target_date=target_date,
+            ledger=ledger,
+            pdca=pdca,
+            web_client=web_search_client,
+            x_search_client=x_search_client,
+        )
 
         planned_posts = _create_next_day_posts(
             session,
@@ -488,6 +658,7 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
         "confirmed_metrics_created": inserted_metrics,
         "cost": {"x_api_cost": str(x_cost), "llm_cost": str(llm_cost), "total": str(x_cost + llm_cost)},
         "planned_posts": planned_posts,
+        "research": research_summary,
     }
     log_path = _write_daily_log(agent_id, target_date, log_payload)
 
