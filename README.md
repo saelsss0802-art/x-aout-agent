@@ -75,6 +75,26 @@ OAuth user context (PKCE) for posting requires scopes mapped to X API v2 endpoin
 Use tweet.write for POST /2/tweets, users.read for GET /2/users/me, and offline.access for refresh tokens.
 Optionally include tweet.read when fetching tweet details/metrics in user context flows.
 
+
+## Web (apps/web) セットアップと起動
+
+Node.js 20 以上を推奨します。
+
+```bash
+cd apps/web
+npm ci
+# またはローカル開発では npm install
+npm run dev
+```
+
+API のベース URL を変更したい場合は環境変数で指定できます。
+
+```bash
+NEXT_PUBLIC_API_BASE_URL=http://localhost:8000 npm run dev
+```
+
+Codex 環境では npm install がセキュリティ制限で失敗する場合がありますが、ローカルでは lockfile に従って起動できます。
+
 ## 起動方法（Docker なし）
 
 ```bash
@@ -117,7 +137,7 @@ python scripts/seed.py
 ## テスト
 
 ```bash
-pytest
+pytest -q
 ```
 
 ## Legacy: Docker compose
