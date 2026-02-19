@@ -50,6 +50,7 @@ from .target_post_source import FakeTargetPostSource, RealXTargetPostSource
 from .summarize import GeminiSummarizeError, GeminiSummarizer
 from .web_fetch_client import WebFetchClient
 from .usage_reconcile import reconcile_app_usage
+from .feature_toggles import read_int_toggle
 
 try:
     from .real_x_client import MissingXUserIdError, RealXClient, XApiError
@@ -238,27 +239,14 @@ def _collect_target_post_candidates(
 
 def _posts_per_day(agent: Agent) -> int:
     env_value = os.getenv("POSTS_PER_DAY")
+    default = 1
     if env_value is not None:
         try:
-            return max(0, int(env_value))
+            default = max(0, int(env_value))
         except ValueError:
-            return 1
-    toggles = agent.feature_toggles if isinstance(agent.feature_toggles, dict) else {}
-    value = toggles.get("posts_per_day", 1)
-    try:
-        return max(0, int(value))
-    except (TypeError, ValueError):
-        return 1
+            default = 1
+    return read_int_toggle(agent, "posts_per_day", default)
 
-
-
-def _int_toggle(agent: Agent, key: str, default: int) -> int:
-    toggles = agent.feature_toggles if isinstance(agent.feature_toggles, dict) else {}
-    value = toggles.get(key, default)
-    try:
-        return max(0, int(value))
-    except (TypeError, ValueError):
-        return default
 
 def _scheduled_datetime_for_plan(target_date: date) -> datetime:
     tz = ZoneInfo(os.getenv("WORKER_TZ", "UTC"))
@@ -543,8 +531,8 @@ def _run_daily_research(
         session,
         agent_id=agent_id,
         target_date=target_date,
-        x_search_max=_int_toggle(agent, "x_search_max", int(os.getenv("X_SEARCH_MAX", "10"))),
-        web_search_max=_int_toggle(agent, "web_search_max", int(os.getenv("WEB_SEARCH_MAX", "10"))),
+        x_search_max=read_int_toggle(agent, "x_search_max", int(os.getenv("X_SEARCH_MAX", "10"))),
+        web_search_max=read_int_toggle(agent, "web_search_max", int(os.getenv("WEB_SEARCH_MAX", "10"))),
     )
     k = int(os.getenv("SEARCH_TOP_K", "3"))
     x_search_cost = Decimal(os.getenv("X_SEARCH_COST", "1.00"))
@@ -653,7 +641,7 @@ def _run_fetch_and_summary(
         session,
         agent_id=agent_id,
         target_date=target_date,
-        web_fetch_max=_int_toggle(agent, "web_fetch_max", int(os.getenv("WEB_FETCH_MAX", "3"))),
+        web_fetch_max=read_int_toggle(agent, "web_fetch_max", int(os.getenv("WEB_FETCH_MAX", "3"))),
     )
     fetch_cost = Decimal(os.getenv("WEB_FETCH_LLM_COST", "0.30"))
     summarize_cost = Decimal(os.getenv("WEB_SUMMARIZE_LLM_COST", "1.00"))
