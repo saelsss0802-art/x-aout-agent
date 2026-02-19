@@ -154,6 +154,15 @@ def _build_poster(account_tokens: dict[int, str] | None = None) -> Poster:
     return FakePoster()
 
 
+def _agent_toggle_int(agent: Agent, key: str, default: int) -> int:
+    toggles = agent.feature_toggles if isinstance(agent.feature_toggles, dict) else {}
+    value = toggles.get(key, default)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
 def _posting_batch_size() -> int:
     raw_value = os.getenv("POSTING_BATCH_SIZE", "10")
     try:
@@ -332,7 +341,12 @@ def run_posting_jobs(base_datetime: datetime, poster: Poster | None = None) -> l
                     continue
 
                 if post.type in (PostType.reply, PostType.quote_rt):
-                    limiter = RateLimiter(session, agent_id=post.agent_id, target_date=current.date(), daily_total_limit=3)
+                    limiter = RateLimiter(
+                        session,
+                        agent_id=post.agent_id,
+                        target_date=current.date(),
+                        daily_total_limit=_agent_toggle_int(agent, "reply_quote_daily_max", 3),
+                    )
                     action_type = ActionType.reply if post.type == PostType.reply else ActionType.quote_rt
                     if limiter.is_limited(action_type=action_type, requested=engagement_attempts + 1):
                         payload = {"type": "rate_limited", "message": "reply_quote_daily_limit_reached"}

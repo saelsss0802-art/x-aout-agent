@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, HTTPException, Query
@@ -28,6 +29,11 @@ app = FastAPI(title="x-aout-agent-api")
 class StopRequest(BaseModel):
     reason: str
     until: datetime | None = None
+
+
+class AgentUpdateRequest(BaseModel):
+    daily_budget: int | None = None
+    feature_toggles: dict[str, Any] | None = None
 
 
 def _cost_to_dict(cost: CostLog | None) -> dict[str, float | int | None]:
@@ -57,6 +63,18 @@ def _agent_to_dict(agent: Agent) -> dict[str, object]:
         "stopped_at": agent.stopped_at.isoformat() if agent.stopped_at else None,
         "stop_until": agent.stop_until.isoformat() if agent.stop_until else None,
         "daily_budget": agent.daily_budget,
+    }
+
+
+def _defaults_payload() -> dict[str, int]:
+    return {
+        "reply_quote_daily_max": 3,
+        "posts_per_day_default": 1,
+        "search_max_default": 10,
+        "fetch_max_default": 3,
+        "split_x": 100,
+        "split_llm": 200,
+        "total": 300,
     }
 
 
@@ -114,6 +132,77 @@ def get_agent(agent_id: int) -> dict[str, object]:
         for row in pdca_rows
     ]
     return result
+
+
+@app.patch("/api/agents/{agent_id}")
+def patch_agent(agent_id: int, payload: AgentUpdateRequest) -> dict[str, object]:
+    patch: dict[str, Any] = {}
+    if payload.daily_budget is not None:
+        if payload.daily_budget < 0:
+            raise HTTPException(status_code=400, detail="daily_budget_invalid")
+        patch["daily_budget"] = payload.daily_budget
+    if payload.feature_toggles is not None:
+        patch["feature_toggles"] = payload.feature_toggles
+    if not patch:
+        raise HTTPException(status_code=400, detail="empty_patch")
+
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as session:
+        agent = session.get(Agent, agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="agent_not_found")
+
+        diff: dict[str, Any] = {}
+        try:
+            if "daily_budget" in patch and agent.daily_budget != patch["daily_budget"]:
+                agent.daily_budget = patch["daily_budget"]
+                diff["daily_budget"] = patch["daily_budget"]
+
+            if "feature_toggles" in patch:
+                current_toggles = dict(agent.feature_toggles or {})
+                for key, value in patch["feature_toggles"].items():
+                    if current_toggles.get(key) != value:
+                        diff[key] = value
+                    current_toggles[key] = value
+                agent.feature_toggles = current_toggles
+
+            session.add(
+                AuditLog(
+                    agent_id=agent_id,
+                    date=now.date(),
+                    source="dashboard",
+                    event_type="agent_update",
+                    status="success",
+                    reason=None,
+                    payload_json=diff,
+                )
+            )
+            session.commit()
+            session.refresh(agent)
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            session.add(
+                AuditLog(
+                    agent_id=agent_id,
+                    date=now.date(),
+                    source="dashboard",
+                    event_type="agent_update",
+                    status="failed",
+                    reason=type(exc).__name__,
+                    payload_json=patch,
+                )
+            )
+            session.commit()
+            raise
+
+    result = _agent_to_dict(agent)
+    result["feature_toggles"] = agent.feature_toggles or {}
+    return result
+
+
+@app.get("/api/config/defaults")
+def get_config_defaults() -> dict[str, int]:
+    return _defaults_payload()
 
 
 @app.get("/api/agents/{agent_id}/audit")

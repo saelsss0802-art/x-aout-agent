@@ -1,27 +1,30 @@
 import Link from "next/link";
 import AgentControls from "../../components/agent-controls";
+import AgentSettingsForm from "../../components/agent-settings-form";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
 async function loadAgent(id) {
-  const [agentRes, auditRes] = await Promise.all([
+  const [agentRes, auditRes, defaultsRes] = await Promise.all([
     fetch(`${API_BASE}/api/agents/${id}`, { cache: "no-store" }),
     fetch(`${API_BASE}/api/agents/${id}/audit?limit=20`, { cache: "no-store" }),
+    fetch(`${API_BASE}/api/config/defaults`, { cache: "no-store" }),
   ]);
 
-  if (!agentRes.ok || !auditRes.ok) {
+  if (!agentRes.ok || !auditRes.ok || !defaultsRes.ok) {
     throw new Error("Failed to load agent detail");
   }
 
   return {
     agent: await agentRes.json(),
     audit: await auditRes.json(),
+    defaults: await defaultsRes.json(),
   };
 }
 
 export default async function AgentDetailPage({ params }) {
   const { id } = params;
-  const { agent, audit } = await loadAgent(id);
+  const { agent, audit, defaults } = await loadAgent(id);
 
   return (
     <main>
@@ -35,6 +38,8 @@ export default async function AgentDetailPage({ params }) {
       <p>Stop until: {agent.stop_until ?? "-"}</p>
 
       <AgentControls agentId={agent.id} />
+      <p>Defaults: {JSON.stringify(defaults)}</p>
+      <AgentSettingsForm agent={agent} />
 
       <h2>Recent PDCA (7d)</h2>
       <ul>
