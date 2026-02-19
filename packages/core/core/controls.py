@@ -1,13 +1,28 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .models import ActionType, CostLog, EngagementAction, FetchLog, SearchLog
+from .models import ActionType, Agent, AgentStatus, AuditLog, CostLog, DailyPDCA, EngagementAction, FetchLog, SearchLog
+
+
+def normalize_post_content(content: str, thread_parts: list[str] | None = None) -> str:
+    if thread_parts:
+        base = "\n".join(part.strip() for part in thread_parts if isinstance(part, str) and part.strip())
+    else:
+        base = content
+    normalized = " ".join(base.split()).strip().lower()
+    return normalized
+
+
+def build_post_content_hash(content: str, thread_parts: list[str] | None = None) -> str:
+    normalized = normalize_post_content(content, thread_parts)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 class BudgetExceededError(RuntimeError):
@@ -265,3 +280,68 @@ class UsageReconciler:
             cost_log.x_api_cost_actual = None
 
         return cost_log
+
+
+class GuardManager:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def is_agent_runnable(self, agent: Agent, now: datetime) -> bool:
+        if agent.status != AgentStatus.active:
+            return False
+        if agent.stop_until is None:
+            return True
+        stop_until = agent.stop_until
+        if stop_until.tzinfo is None:
+            stop_until = stop_until.replace(tzinfo=timezone.utc)
+        return stop_until <= now
+
+    def record_audit(
+        self,
+        *,
+        agent_id: int,
+        target_date: date,
+        source: str,
+        event_type: str,
+        status: str,
+        reason: str | None = None,
+        payload: dict[str, object] | None = None,
+    ) -> AuditLog:
+        audit = AuditLog(
+            agent_id=agent_id,
+            date=target_date,
+            source=source,
+            event_type=event_type,
+            status=status,
+            reason=reason,
+            payload_json=payload or {},
+        )
+        self.session.add(audit)
+        return audit
+
+    def maybe_auto_stop(self, agent_id: int, *, now: datetime, reason: str, source: str, payload: dict[str, object] | None = None) -> Agent | None:
+        agent = self.session.get(Agent, agent_id)
+        if agent is None:
+            return None
+        if agent.status == AgentStatus.stopped and agent.stop_reason == reason:
+            return agent
+
+        agent.status = AgentStatus.stopped
+        agent.stop_reason = reason
+        agent.stopped_at = now
+        self.record_audit(
+            agent_id=agent_id,
+            target_date=now.date(),
+            source=source,
+            event_type='auto_stop',
+            status='triggered',
+            reason=reason,
+            payload=payload,
+        )
+
+        pdca = self.session.scalar(select(DailyPDCA).where(DailyPDCA.agent_id == agent_id, DailyPDCA.date == now.date()))
+        if pdca is not None:
+            summary = dict(pdca.analytics_summary or {})
+            summary['auto_stop'] = {'reason': reason, 'source': source}
+            pdca.analytics_summary = summary
+        return agent
