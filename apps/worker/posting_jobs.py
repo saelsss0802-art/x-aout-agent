@@ -16,6 +16,7 @@ from core.db import SessionLocal
 from core.models import ActionType, Agent, DailyPDCA, Post, PostType, XAuthToken
 
 from .real_x_client import RealXClient
+from .usage_reconcile import reconcile_app_usage
 
 X_TOKEN_URL = "https://api.x.com/2/oauth2/token"
 
@@ -304,6 +305,12 @@ def run_posting_jobs(base_datetime: datetime, poster: Poster | None = None) -> l
                 _append_pdca_error(session, post.agent_id, current.date(), payload)
                 _log_posting_error(post.id, payload)
                 results.append({"post_id": post.id, "status": "failed", "error": payload})
+
+        if os.getenv("POSTING_USAGE_RECONCILE") == "1":
+            try:
+                reconcile_app_usage(session, usage_date=current.date())
+            except Exception:
+                pass
 
         session.commit()
 

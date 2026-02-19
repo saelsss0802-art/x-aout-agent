@@ -47,6 +47,7 @@ from .content_planner import build_post_drafts
 from .target_post_source import FakeTargetPostSource, RealXTargetPostSource
 from .summarize import GeminiSummarizeError, GeminiSummarizer
 from .web_fetch_client import WebFetchClient
+from .usage_reconcile import reconcile_app_usage
 
 try:
     from .real_x_client import MissingXUserIdError, RealXClient, XApiError
@@ -431,35 +432,6 @@ def _save_confirmed_metrics(
         )
     )
     return True
-
-
-def _apply_usage(session: Session, *, agent_id: int, usage_date: date, x_client: XClient) -> bool:
-    if os.getenv("USE_X_USAGE") != "1":
-        return True
-
-    usage = x_client.get_daily_usage(usage_date=usage_date)
-    cost_log = session.scalar(select(CostLog).where(CostLog.agent_id == agent_id, CostLog.date == usage_date))
-    if cost_log is None:
-        cost_log = CostLog(
-            agent_id=agent_id,
-            date=usage_date,
-            x_api_cost=Decimal("0"),
-            llm_cost=Decimal("0"),
-            image_gen_cost=Decimal("0"),
-            total=Decimal("0"),
-        )
-        session.add(cost_log)
-    cost_log.x_usage_units = usage.units
-    cost_log.x_usage_raw = usage.raw
-
-    unit_price = Decimal(os.getenv("X_UNIT_PRICE", "0"))
-    if unit_price > 0:
-        measured_x_cost = Decimal(usage.units) * unit_price
-        cost_log.x_api_cost = measured_x_cost.quantize(Decimal("0.01"))
-        cost_log.total = Decimal(cost_log.x_api_cost) + Decimal(cost_log.llm_cost) + Decimal(cost_log.image_gen_cost)
-    return True
-
-
 
 
 def _build_research_queries(agent_id: int, target_date: date) -> list[str]:
@@ -997,14 +969,19 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
 
         ledger.commit()
 
-        usage_fetch_failed = False
+        usage_summary: dict[str, object]
         try:
-            _apply_usage(session, agent_id=agent_id, usage_date=target_date, x_client=x_client)
-        except (XApiError, ValueError):
-            usage_fetch_failed = True
+            usage_summary = reconcile_app_usage(session, usage_date=target_date)
+        except Exception as exc:
+            usage_summary = {
+                "x_usage_reconciled": False,
+                "usage_fetch_failed": True,
+                "usage_error": str(exc)[:160],
+            }
 
-        if usage_fetch_failed:
-            pdca.analysis = {**pdca.analysis, "usage_fetch_failed": True}
+        analytics = dict(pdca.analytics_summary or {})
+        analytics.update(usage_summary)
+        pdca.analytics_summary = analytics
 
         budget_status = ledger.status()
         rate_status = rate_limiter.status(action_type=ActionType.reply)

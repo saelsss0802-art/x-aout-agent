@@ -83,6 +83,7 @@ class BudgetLedger:
                     agent_id=self.agent_id,
                     date=self.target_date,
                     x_api_cost=self._x_reserved,
+                    x_api_cost_estimate=self._x_reserved,
                     llm_cost=self._llm_reserved,
                     image_gen_cost=Decimal("0"),
                     total=total_reserved,
@@ -90,6 +91,7 @@ class BudgetLedger:
             )
         else:
             cost.x_api_cost = Decimal(cost.x_api_cost) + self._x_reserved
+            cost.x_api_cost_estimate = Decimal(cost.x_api_cost_estimate) + self._x_reserved
             cost.llm_cost = Decimal(cost.llm_cost) + self._llm_reserved
             cost.total = Decimal(cost.total) + total_reserved
 
@@ -230,3 +232,36 @@ class RateLimiter:
             "total_remaining": max(0, self.daily_total_limit - used_total),
             "type_used": used_type,
         }
+
+
+class UsageReconciler:
+    def __init__(self, session: Session, *, app_agent_id: int = 0, unit_price: Decimal | None = None) -> None:
+        self.session = session
+        self.app_agent_id = app_agent_id
+        self.unit_price = unit_price
+
+    def reconcile_x_usage(self, *, target_date: date, units: int, raw: dict[str, object]) -> CostLog:
+        cost_log = self.session.scalar(
+            select(CostLog).where(CostLog.agent_id == self.app_agent_id, CostLog.date == target_date)
+        )
+        if cost_log is None:
+            cost_log = CostLog(
+                agent_id=self.app_agent_id,
+                date=target_date,
+                x_api_cost=Decimal("0"),
+                x_api_cost_estimate=Decimal("0"),
+                llm_cost=Decimal("0"),
+                image_gen_cost=Decimal("0"),
+                total=Decimal("0"),
+            )
+            self.session.add(cost_log)
+
+        cost_log.x_usage_units = units
+        cost_log.x_usage_raw = raw
+
+        if self.unit_price is not None and self.unit_price > Decimal("0"):
+            cost_log.x_api_cost_actual = (Decimal(units) * self.unit_price).quantize(Decimal("0.01"))
+        else:
+            cost_log.x_api_cost_actual = None
+
+        return cost_log
