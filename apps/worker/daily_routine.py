@@ -251,6 +251,15 @@ def _posts_per_day(agent: Agent) -> int:
         return 1
 
 
+
+def _int_toggle(agent: Agent, key: str, default: int) -> int:
+    toggles = agent.feature_toggles if isinstance(agent.feature_toggles, dict) else {}
+    value = toggles.get(key, default)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
 def _scheduled_datetime_for_plan(target_date: date) -> datetime:
     tz = ZoneInfo(os.getenv("WORKER_TZ", "UTC"))
     hour = int(os.getenv("POST_HOUR", "9"))
@@ -527,12 +536,15 @@ def _run_daily_research(
     web_client: WebSearchClient,
     x_search_client: XSearchClient,
 ) -> dict[str, object]:
+    agent = session.get(Agent, agent_id)
+    if agent is None:
+        raise ValueError("agent_not_found")
     limiter = SearchLimiter(
         session,
         agent_id=agent_id,
         target_date=target_date,
-        x_search_max=int(os.getenv("X_SEARCH_MAX", "10")),
-        web_search_max=int(os.getenv("WEB_SEARCH_MAX", "10")),
+        x_search_max=_int_toggle(agent, "x_search_max", int(os.getenv("X_SEARCH_MAX", "10"))),
+        web_search_max=_int_toggle(agent, "web_search_max", int(os.getenv("WEB_SEARCH_MAX", "10"))),
     )
     k = int(os.getenv("SEARCH_TOP_K", "3"))
     x_search_cost = Decimal(os.getenv("X_SEARCH_COST", "1.00"))
@@ -634,11 +646,14 @@ def _run_fetch_and_summary(
     ledger: BudgetLedger,
     search_records: list[dict[str, object]],
 ) -> dict[str, object]:
+    agent = session.get(Agent, agent_id)
+    if agent is None:
+        raise ValueError("agent_not_found")
     fetch_limiter = FetchLimiter(
         session,
         agent_id=agent_id,
         target_date=target_date,
-        web_fetch_max=int(os.getenv("WEB_FETCH_MAX", "3")),
+        web_fetch_max=_int_toggle(agent, "web_fetch_max", int(os.getenv("WEB_FETCH_MAX", "3"))),
     )
     fetch_cost = Decimal(os.getenv("WEB_FETCH_LLM_COST", "0.30"))
     summarize_cost = Decimal(os.getenv("WEB_SUMMARIZE_LLM_COST", "1.00"))
