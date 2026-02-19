@@ -22,6 +22,7 @@ from .db.models import (
     SearchLog,
     SharedKnowledge,
     TargetAccount,
+    TargetPostCandidate,
 )
 
 __all__ = [
@@ -48,4 +49,5 @@ __all__ = [
     "SearchLog",
     "SharedKnowledge",
     "TargetAccount",
+    "TargetPostCandidate",
 ]

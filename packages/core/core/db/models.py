@@ -267,6 +267,26 @@ class EngagementAction(Base):
     )
 
 
+class TargetPostCandidate(Base):
+    __tablename__ = "target_post_candidates"
+    __table_args__ = (
+        Index("ix_target_post_candidates_agent_date", "agent_id", "date"),
+        Index("ix_target_post_candidates_agent_date_used", "agent_id", "date", "used"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id"), nullable=False, index=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False)
+    target_handle: Mapped[str] = mapped_column(String(255), nullable=False)
+    url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    post_created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="0")
+    created_at_ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class CostLog(Base):
     __tablename__ = "cost_logs"
     __table_args__ = (Index("ix_cost_logs_date", "date"),)

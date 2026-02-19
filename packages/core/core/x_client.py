@@ -34,6 +34,15 @@ class XUsage:
     raw: dict[str, object] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class TargetPost:
+    external_id: str
+    url: str
+    author_handle: str
+    text: str
+    created_at: datetime
+
+
 class XClient(Protocol):
     def resolve_user_id(self, handle_or_me: str = "me") -> str: ...
 
@@ -42,3 +51,7 @@ class XClient(Protocol):
     def get_post_metrics(self, external_post: ExternalPost) -> ExternalPostMetrics: ...
 
     def get_daily_usage(self, usage_date: date) -> XUsage: ...
+
+
+class TargetPostSource(Protocol):
+    def list_target_posts(self, agent_id: int, handles: list[str], limit: int) -> list[TargetPost]: ...
