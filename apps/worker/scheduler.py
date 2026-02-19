@@ -16,6 +16,7 @@ from core.models import Agent, AgentStatus, DailyPDCA
 
 from .daily_routine import run_daily_routine
 from .posting_jobs import run_posting_jobs
+from .usage_reconcile import reconcile_app_usage
 
 
 def _require_database_url() -> None:
@@ -102,6 +103,14 @@ def run_all_agents(base_date: date | None = None) -> list[dict[str, Any]]:
 
         results.append(status_payload)
         print(json.dumps(status_payload, ensure_ascii=True))
+
+    if os.getenv("USE_X_USAGE") == "1":
+        try:
+            with SessionLocal() as session:
+                reconcile_app_usage(session, usage_date=target_date)
+                session.commit()
+        except Exception:
+            pass
 
     return results
 

@@ -296,13 +296,17 @@ class CostLog(Base):
     agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id"), nullable=False, index=True)
     date: Mapped[date] = mapped_column(Date, nullable=False)
     x_api_cost: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
+    x_api_cost_estimate: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), nullable=False, default=0, server_default="0"
+    )
+    x_api_cost_actual: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
     llm_cost: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
     image_gen_cost: Mapped[Decimal] = mapped_column(
         Numeric(12, 2), nullable=False, default=0, server_default="0"
     )
     total: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
-    x_usage_units: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
-    x_usage_raw: Mapped[dict[str, Any]] = mapped_column(JSONType, nullable=False, default=dict)
+    x_usage_units: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    x_usage_raw: Mapped[dict[str, Any] | None] = mapped_column(JSONType, nullable=True)
 
 
 class SearchLog(Base):
