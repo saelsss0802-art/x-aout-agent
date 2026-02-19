@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from core import BudgetLedger
-from core.models import FetchLog, PostType, SearchLog
+from core.models import FetchLog, PostType, SearchLog, TargetPostCandidate
 
 _URL_RE = re.compile(r"https?://\S+")
 
@@ -60,19 +60,17 @@ def _extract_web_facts(search_logs: list[SearchLog], fetch_logs: list[FetchLog])
     return [fact for fact in facts if fact]
 
 
-def _extract_x_targets(search_logs: list[SearchLog]) -> list[str]:
-    targets: list[str] = []
-    for log in search_logs:
-        if log.source != "x":
-            continue
-        payload = log.results_json if isinstance(log.results_json, dict) else {}
-        results = payload.get("results", []) if isinstance(payload, dict) else []
-        for item in results if isinstance(results, list) else []:
-            if isinstance(item, dict):
-                url = str(item.get("url", "")).strip()
-                if url.startswith("http"):
-                    targets.append(url)
-    return targets
+def _extract_x_targets(session: Session, *, agent_id: int, target_date: date) -> list[str]:
+    rows = session.scalars(
+        select(TargetPostCandidate)
+        .where(
+            TargetPostCandidate.agent_id == agent_id,
+            TargetPostCandidate.date == target_date,
+            TargetPostCandidate.used.is_(False),
+        )
+        .order_by(TargetPostCandidate.post_created_at.asc(), TargetPostCandidate.id.asc())
+    ).all()
+    return [row.url for row in rows]
 
 
 def _append_optional_url(text: str, target_url: str | None, allow_url: bool) -> str:
@@ -112,7 +110,7 @@ def build_post_drafts(
     ).all()
 
     facts = _extract_web_facts(search_logs, fetch_logs)
-    targets = _extract_x_targets(search_logs)
+    targets = _extract_x_targets(session, agent_id=agent_id, target_date=target_date)
     used_search_material = bool(facts or targets)
     if not facts:
         facts = _fallback_facts(agent_id, target_date)

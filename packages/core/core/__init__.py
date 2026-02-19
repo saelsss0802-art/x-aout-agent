@@ -5,7 +5,7 @@ from .controls import BudgetExceededError, BudgetLedger, FetchLimiter, RateLimit
 from .interfaces import Poster, WorkerJob
 from .models import Heartbeat
 from .placeholders import DomainPlaceholder
-from .x_client import ExternalPost, ExternalPostMetrics, XClient, XUsage
+from .x_client import ExternalPost, ExternalPostMetrics, TargetPost, TargetPostSource, XClient, XUsage
 
 __all__ = [
     "Base",
@@ -21,5 +21,7 @@ __all__ = [
     "XClient",
     "ExternalPost",
     "ExternalPostMetrics",
+    "TargetPost",
+    "TargetPostSource",
     "XUsage",
 ]

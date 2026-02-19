@@ -20,6 +20,7 @@ from core import (
     FetchLimiter,
     RateLimiter,
     SearchLimiter,
+    TargetPost,
     XClient,
     XUsage,
 )
@@ -38,9 +39,12 @@ from core.models import (
     PostMetrics,
     PostType,
     SearchLog,
+    TargetAccount,
+    TargetPostCandidate,
 )
 from .gemini_web_search_client import GeminiWebSearchClient, GeminiWebSearchError
 from .content_planner import build_post_drafts
+from .target_post_source import FakeTargetPostSource, RealXTargetPostSource
 from .summarize import GeminiSummarizeError, GeminiSummarizer
 from .web_fetch_client import WebFetchClient
 
@@ -151,6 +155,84 @@ class FakeXClient:
         return XUsage(usage_date=usage_date, units=0, raw={"source": "fake"})
 
 
+def _build_target_post_source(account: Account | None = None) -> object:
+    if os.getenv("USE_REAL_X") == "1":
+        token = os.getenv("X_BEARER_TOKEN")
+        if not token or RealXClient is None:
+            return FakeTargetPostSource()
+        account_user_id = None
+        if account and isinstance(account.api_keys, dict):
+            raw = account.api_keys.get("x_user_id")
+            if isinstance(raw, str):
+                account_user_id = raw
+        user_id = os.getenv("X_USER_ID") or account_user_id
+        client = RealXClient(bearer_token=token, user_id=user_id)
+        return RealXTargetPostSource(client)
+    return FakeTargetPostSource()
+
+
+def _collect_target_post_candidates(
+    session: Session,
+    *,
+    agent: Agent,
+    target_date: date,
+    ledger: BudgetLedger,
+) -> dict[str, object]:
+    handles_raw = session.scalars(
+        select(TargetAccount.handle).where(TargetAccount.agent_id == agent.id).order_by(TargetAccount.id.asc())
+    ).all()
+    max_accounts = max(0, int(os.getenv("TARGET_ACCOUNTS_FETCH_MAX", "10")))
+    handles = [h.lstrip("@").strip().lower() for h in handles_raw if isinstance(h, str) and h.strip()]
+    handles = handles[:max_accounts] if max_accounts else []
+
+    if not handles:
+        return {"count": 0, "reason": "no_target_accounts", "handles": []}
+
+    fetch_limit = max(0, int(os.getenv("TARGET_POSTS_FETCH_MAX", "10")))
+    if fetch_limit == 0:
+        return {"count": 0, "reason": "fetch_limit_zero", "handles": handles}
+
+    x_cost = Decimal(os.getenv("TARGET_POST_FETCH_COST", "0.25"))
+    try:
+        ledger.reserve(x_cost=x_cost, llm_cost=Decimal("0"))
+    except BudgetExceededError:
+        return {"count": 0, "reason": "target_fetch_budget_exceeded", "handles": handles}
+
+    source = _build_target_post_source(agent.account)
+    try:
+        posts = source.list_target_posts(agent_id=agent.id, handles=handles, limit=fetch_limit)
+    except Exception as exc:  # noqa: BLE001
+        return {"count": 0, "reason": f"target_fetch_failed:{exc.__class__.__name__}", "handles": handles}
+
+    saved = 0
+    for post in posts:
+        if not isinstance(post, TargetPost):
+            continue
+        exists = session.scalar(
+            select(TargetPostCandidate).where(
+                TargetPostCandidate.agent_id == agent.id,
+                TargetPostCandidate.date == target_date,
+                TargetPostCandidate.url == post.url,
+            )
+        )
+        if exists:
+            continue
+        session.add(
+            TargetPostCandidate(
+                agent_id=agent.id,
+                date=target_date,
+                target_handle=post.author_handle,
+                url=post.url,
+                text=post.text,
+                post_created_at=post.created_at,
+                used=False,
+            )
+        )
+        saved += 1
+
+    return {"count": saved, "reason": "ok", "handles": handles}
+
+
 def _posts_per_day(agent: Agent) -> int:
     env_value = os.getenv("POSTS_PER_DAY")
     if env_value is not None:
@@ -215,7 +297,10 @@ def _create_next_day_posts(
     pdca.analytics_summary = analytics
 
     created: list[dict[str, object]] = []
+    used_urls: set[str] = set()
     for idx, draft in enumerate(plan_result.drafts):
+        if draft.target_post_url:
+            used_urls.add(draft.target_post_url)
         post = Post(
             agent_id=agent.id,
             content=draft.text,
@@ -238,6 +323,17 @@ def _create_next_day_posts(
                 "has_target_post_url": bool(post.target_post_url),
             }
         )
+
+    if used_urls:
+        candidates = session.scalars(
+            select(TargetPostCandidate).where(
+                TargetPostCandidate.agent_id == agent.id,
+                TargetPostCandidate.date == target_date,
+                TargetPostCandidate.url.in_(used_urls),
+            )
+        ).all()
+        for candidate in candidates:
+            candidate.used = True
 
     posts_created = list(pdca.posts_created or [])
     posts_created.extend(created)
@@ -855,6 +951,16 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
             session.add(pdca)
         else:
             pdca.analytics_summary = analytics_summary
+
+        target_summary = _collect_target_post_candidates(
+            session,
+            agent=agent,
+            target_date=target_date,
+            ledger=ledger,
+        )
+        analytics = dict(pdca.analytics_summary or {})
+        analytics["target_posts"] = target_summary
+        pdca.analytics_summary = analytics
 
         research_summary = _run_daily_research(
             session,

@@ -23,6 +23,7 @@ from core.models import (
     PostType,
     SearchLog,
     TargetAccount,
+    TargetPostCandidate,
 )
 
 
@@ -79,6 +80,17 @@ def test_content_planner_url_exposure_rule(monkeypatch) -> None:
                     ]
                 },
                 cost_estimate=Decimal("0"),
+            )
+        )
+        session.add(
+            TargetPostCandidate(
+                agent_id=agent.id,
+                date=date(2026, 1, 8),
+                target_handle="example",
+                url="https://x.com/example/status/1",
+                text="sample",
+                post_created_at=datetime(2026, 1, 8, 9, tzinfo=timezone.utc),
+                used=False,
             )
         )
         session.commit()
@@ -236,3 +248,117 @@ def test_posting_jobs_supports_all_types_and_rate_limits(monkeypatch) -> None:
     posted_types = {p.type for p in posts if p.posted_at is not None}
     assert posted_types == {PostType.tweet, PostType.thread}
     assert all(p.posted_at is None for p in posts if p.type in (PostType.reply, PostType.quote_rt))
+
+
+def test_daily_routine_collects_target_post_candidates(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("POSTS_PER_DAY", "2")
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setattr(daily_routine, "engine", engine)
+    monkeypatch.setattr(daily_routine, "SessionLocal", SessionLocal)
+
+    with Session(engine) as session:
+        agent = _setup_agent(session, 120)
+        session.add(TargetAccount(agent_id=agent.id, handle="target_user", like_limit=3, reply_limit=3, quote_rt_limit=3))
+        session.commit()
+
+    result = daily_routine.run_daily_routine(agent_id=120, base_date=date(2026, 1, 10))
+    assert result["status"] == "success"
+
+    with Session(engine) as session:
+        candidates = session.scalars(
+            select(TargetPostCandidate).where(TargetPostCandidate.agent_id == 120)
+        ).all()
+
+    assert candidates
+    assert all(candidate.url.startswith("https://x.com/target_user/status/") for candidate in candidates)
+
+
+def test_content_planner_uses_target_candidates_for_reply_quote(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(bind=engine)
+
+    with Session(engine) as session:
+        agent = _setup_agent(session, 121)
+        target_date = date(2026, 1, 8)
+        session.add_all(
+            [
+                TargetPostCandidate(
+                    agent_id=agent.id,
+                    date=target_date,
+                    target_handle="target_user",
+                    url="https://x.com/target_user/status/1",
+                    text="one",
+                    post_created_at=datetime(2026, 1, 8, 1, tzinfo=timezone.utc),
+                    used=False,
+                ),
+                TargetPostCandidate(
+                    agent_id=agent.id,
+                    date=target_date,
+                    target_handle="target_user",
+                    url="https://x.com/target_user/status/2",
+                    text="two",
+                    post_created_at=datetime(2026, 1, 8, 2, tzinfo=timezone.utc),
+                    used=False,
+                ),
+            ]
+        )
+        session.commit()
+
+        ledger = BudgetLedger(
+            session,
+            agent_id=agent.id,
+            target_date=target_date,
+            daily_budget=300,
+            split_x=100,
+            split_llm=200,
+        )
+
+        monkeypatch.setenv("PLAN_THREAD_RATIO", "0")
+        monkeypatch.setenv("PLAN_REPLY_RATIO", "0.5")
+        monkeypatch.setenv("PLAN_QUOTE_RATIO", "0.5")
+        plan = build_post_drafts(session, agent_id=agent.id, target_date=target_date, posts_per_day=2, ledger=ledger)
+
+    assert {d.type for d in plan.drafts} == {PostType.reply, PostType.quote_rt}
+    assert all(d.target_post_url for d in plan.drafts)
+
+
+def test_content_planner_rebalances_when_target_candidates_exhausted(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(bind=engine)
+
+    with Session(engine) as session:
+        agent = _setup_agent(session, 122)
+        target_date = date(2026, 1, 8)
+        session.add(
+            TargetPostCandidate(
+                agent_id=agent.id,
+                date=target_date,
+                target_handle="target_user",
+                url="https://x.com/target_user/status/used",
+                text="used",
+                post_created_at=datetime(2026, 1, 8, 1, tzinfo=timezone.utc),
+                used=True,
+            )
+        )
+        session.commit()
+
+        ledger = BudgetLedger(
+            session,
+            agent_id=agent.id,
+            target_date=target_date,
+            daily_budget=300,
+            split_x=100,
+            split_llm=200,
+        )
+
+        monkeypatch.setenv("PLAN_THREAD_RATIO", "0")
+        monkeypatch.setenv("PLAN_REPLY_RATIO", "0.5")
+        monkeypatch.setenv("PLAN_QUOTE_RATIO", "0.5")
+        plan = build_post_drafts(session, agent_id=agent.id, target_date=target_date, posts_per_day=3, ledger=ledger)
+
+    assert all(d.type in (PostType.tweet, PostType.thread) for d in plan.drafts)
+    assert all(d.target_post_url is None for d in plan.drafts)
