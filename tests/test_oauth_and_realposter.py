@@ -187,3 +187,50 @@ def test_posting_jobs_real_poster_refresh_and_post(monkeypatch) -> None:
     assert post is not None and post.external_id == "tweet-123"
     assert post.posted_at is not None
     assert token is not None and token.access_token == "new-access"
+
+
+def test_extract_tweet_id_supports_target_url_variants() -> None:
+    target_id = "1901234567890123456"
+    urls = [
+        f"https://x.com/someuser/status/{target_id}",
+        f"https://twitter.com/someuser/status/{target_id}",
+        f"https://x.com/i/web/status/{target_id}",
+        f"https://x.com/someuser/status/{target_id}/photo/1",
+        f"https://twitter.com/someuser/status/{target_id}?s=20",
+    ]
+
+    for url in urls:
+        assert posting_jobs.extract_tweet_id(url) == target_id
+
+
+def test_posting_jobs_reply_invalid_target_url_is_skipped(monkeypatch) -> None:
+    engine = _setup_db(monkeypatch)
+
+    with Session(engine) as session:
+        account = Account(name="acct", type=AccountType.business, api_keys={}, media_assets_path="/tmp")
+        session.add(account)
+        session.flush()
+        agent = Agent(account_id=account.id, status=AgentStatus.active, feature_toggles={})
+        session.add(agent)
+        session.flush()
+        post = Post(
+            agent_id=agent.id,
+            content="reply",
+            type=PostType.reply,
+            media_urls=[],
+            target_post_url="https://example.com/not-a-status-url",
+            scheduled_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+        session.add(post)
+        session.commit()
+        post_id = post.id
+
+    result = posting_jobs.run_posting_jobs(base_datetime=datetime.now(timezone.utc))
+    assert any(item == {"post_id": post_id, "status": "skipped", "reason": "invalid_target_url"} for item in result)
+
+    with Session(engine) as session:
+        post = session.get(Post, post_id)
+
+    assert post is not None
+    assert post.posted_at is None
+    assert post.external_id is None

@@ -67,15 +67,23 @@ class RealPoster:
         return first_id
 
     def post_reply(self, agent_id: int, target_post_url: str, text: str) -> str:
-        target_id = _extract_tweet_id(target_post_url)
+        target_id = extract_tweet_id(target_post_url)
+        if not target_id:
+            raise ValueError("target_post_url_invalid")
         return self._client_for_agent(agent_id).create_tweet(text=text, in_reply_to_tweet_id=target_id)
 
     def post_quote_rt(self, agent_id: int, target_post_url: str, text: str) -> str:
-        target_id = _extract_tweet_id(target_post_url)
+        target_id = extract_tweet_id(target_post_url)
+        if not target_id:
+            raise ValueError("target_post_url_invalid")
         return self._client_for_agent(agent_id).create_tweet(text=text, quote_tweet_id=target_id)
 
 
 class XAuthRefreshError(RuntimeError):
+    pass
+
+
+class InvalidTargetUrlError(ValueError):
     pass
 
 
@@ -206,10 +214,14 @@ def _post_with_type(posting_poster: Poster, post: Post) -> str:
     if post.type == PostType.reply:
         if not post.target_post_url:
             raise ValueError("target_post_url_required")
+        if not extract_tweet_id(post.target_post_url):
+            raise InvalidTargetUrlError("invalid_target_url")
         return posting_poster.post_reply(post.agent_id, post.target_post_url, post.content)
     if post.type == PostType.quote_rt:
         if not post.target_post_url:
             raise ValueError("target_post_url_required")
+        if not extract_tweet_id(post.target_post_url):
+            raise InvalidTargetUrlError("invalid_target_url")
         return posting_poster.post_quote_rt(post.agent_id, post.target_post_url, post.content)
     raise ValueError(f"unsupported_post_type:{post.type.value}")
 
@@ -277,6 +289,11 @@ def run_posting_jobs(base_datetime: datetime, poster: Poster | None = None) -> l
                 ledger.commit()
                 session.flush()
                 results.append({"post_id": post.id, "status": "posted", "external_id": external_id})
+            except InvalidTargetUrlError as exc:
+                payload = {"type": "invalid_target_url", "message": str(exc)}
+                _append_pdca_error(session, post.agent_id, current.date(), payload)
+                _log_posting_error(post.id, payload)
+                results.append({"post_id": post.id, "status": "skipped", "reason": "invalid_target_url"})
             except BudgetExceededError as exc:
                 payload = {"type": type(exc).__name__, "message": str(exc)}
                 _append_pdca_error(session, post.agent_id, current.date(), payload)
@@ -293,8 +310,12 @@ def run_posting_jobs(base_datetime: datetime, poster: Poster | None = None) -> l
     return results
 
 
-def _extract_tweet_id(url: str) -> str:
-    matched = re.search(r"/status/(\d+)", url)
+def extract_tweet_id(url: str) -> str:
+    matched = re.search(
+        r"(?:https?://)?(?:www\.)?(?:x\.com|twitter\.com)/(?:(?:[^/?#]+/)?status|i/web/status)/(\d+)(?:[/?#]|$)",
+        url,
+        flags=re.IGNORECASE,
+    )
     if not matched:
-        raise ValueError("target_post_url_invalid")
+        return ""
     return matched.group(1)
