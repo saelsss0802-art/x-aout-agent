@@ -70,6 +70,11 @@ X API v2 is pay-per-usage and endpoint unit prices are configured in the Develop
 
 X API related worker tests use httpx mocks and require the httpx package to be installed in the test environment.
 
+
+OAuth user context (PKCE) for posting requires scopes mapped to X API v2 endpoints.
+Use tweet.write for POST /2/tweets, users.read for GET /2/users/me, and offline.access for refresh tokens.
+Optionally include tweet.read when fetching tweet details/metrics in user context flows.
+
 ## 起動方法（Docker なし）
 
 ```bash

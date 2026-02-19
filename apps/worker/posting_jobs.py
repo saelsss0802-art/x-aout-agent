@@ -2,21 +2,22 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
+import httpx
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session
 
 from core import BudgetExceededError, BudgetLedger, Poster, RateLimiter
 from core.db import SessionLocal
-from core.models import ActionType, Agent, DailyPDCA, Post, PostType
+from core.models import ActionType, Agent, DailyPDCA, Post, PostType, XAuthToken
 
-try:
-    from .real_x_client import RealXClient
-except ModuleNotFoundError:
-    RealXClient = None  # type: ignore[assignment]
+from .real_x_client import RealXClient
+
+X_TOKEN_URL = "https://api.x.com/2/oauth2/token"
 
 
 class FakePoster:
@@ -41,34 +42,106 @@ class FakePoster:
         return self._fake_id(agent_id, "quote")
 
 
-class RealXPoster:
-    def __init__(self, x_client: RealXClient) -> None:
-        self._x_client = x_client
+class RealPoster:
+    def __init__(self, account_tokens: dict[int, str], http_client: httpx.Client | None = None) -> None:
+        self._account_tokens = account_tokens
+        self._http_client = http_client or httpx.Client(timeout=15.0)
+
+    def _client_for_agent(self, agent_id: int) -> RealXClient:
+        token = self._account_tokens.get(agent_id)
+        if not token:
+            raise RuntimeError("x_auth_token_not_found")
+        return RealXClient(bearer_token=token, http_client=self._http_client)
 
     def post_text(self, agent_id: int, text: str) -> str:
-        del agent_id
-        return self._x_client.post_text(text)
+        return self._client_for_agent(agent_id).create_tweet(text=text)
 
     def post_thread(self, agent_id: int, parts: list[str]) -> str:
-        del agent_id
         if not parts:
             raise ValueError("thread_parts_required")
-        return self._x_client.post_text("\n".join(parts))
+        client = self._client_for_agent(agent_id)
+        first_id = client.create_tweet(text=parts[0])
+        prev_id = first_id
+        for part in parts[1:]:
+            prev_id = client.create_tweet(text=part, in_reply_to_tweet_id=prev_id)
+        return first_id
 
     def post_reply(self, agent_id: int, target_post_url: str, text: str) -> str:
-        del agent_id, target_post_url
-        return self._x_client.post_text(text)
+        target_id = _extract_tweet_id(target_post_url)
+        return self._client_for_agent(agent_id).create_tweet(text=text, in_reply_to_tweet_id=target_id)
 
     def post_quote_rt(self, agent_id: int, target_post_url: str, text: str) -> str:
-        del agent_id, target_post_url
-        return self._x_client.post_text(text)
+        target_id = _extract_tweet_id(target_post_url)
+        return self._client_for_agent(agent_id).create_tweet(text=text, quote_tweet_id=target_id)
 
 
-def _build_poster() -> Poster:
+class XAuthRefreshError(RuntimeError):
+    pass
+
+
+class AccountTokenProvider:
+    def __init__(self, session: Session, http_client: httpx.Client | None = None) -> None:
+        self._session = session
+        self._http_client = http_client or httpx.Client(timeout=15.0)
+
+    def token_for_agent(self, agent: Agent, now: datetime) -> str:
+        token = self._session.scalar(select(XAuthToken).where(XAuthToken.account_id == agent.account_id))
+        if token is None:
+            raise XAuthRefreshError("x_auth_token_not_found")
+
+        expires_at = token.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= now + timedelta(minutes=2):
+            token = self._refresh(token)
+        return token.access_token
+
+    def _refresh(self, token: XAuthToken) -> XAuthToken:
+        client_id = os.getenv("X_OAUTH_CLIENT_ID")
+        if not client_id:
+            raise XAuthRefreshError("X_OAUTH_CLIENT_ID is required")
+        payload = {
+            "grant_type": "refresh_token",
+            "refresh_token": token.refresh_token,
+            "client_id": client_id,
+        }
+        client_secret = os.getenv("X_OAUTH_CLIENT_SECRET")
+        auth = (client_id, client_secret) if client_secret else None
+        try:
+            response = self._http_client.post(
+                X_TOKEN_URL,
+                data=payload,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                auth=auth,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise XAuthRefreshError("x_auth_refresh_failed") from exc
+
+        parsed = response.json()
+        if not isinstance(parsed, dict):
+            raise XAuthRefreshError("x_auth_refresh_invalid_response")
+
+        access_token = parsed.get("access_token")
+        refresh_token = parsed.get("refresh_token")
+        expires_in = parsed.get("expires_in")
+        if not isinstance(access_token, str) or not isinstance(refresh_token, str) or not isinstance(expires_in, (int, float)):
+            raise XAuthRefreshError("x_auth_refresh_invalid_payload")
+
+        token.access_token = access_token
+        token.refresh_token = refresh_token
+        token.expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))
+        if isinstance(parsed.get("scope"), str):
+            token.scope = parsed["scope"]
+        if isinstance(parsed.get("token_type"), str):
+            token.token_type = parsed["token_type"]
+        self._session.flush()
+        return token
+
+
+def _build_poster(account_tokens: dict[int, str] | None = None) -> Poster:
     if os.getenv("USE_REAL_X") == "1":
-        if RealXClient is None:
-            raise RuntimeError("httpx is required when USE_REAL_X=1")
-        return RealXPoster(RealXClient.from_env())
+        return RealPoster(account_tokens or {})
     return FakePoster()
 
 
@@ -143,16 +216,36 @@ def _post_with_type(posting_poster: Poster, post: Post) -> str:
 
 def run_posting_jobs(base_datetime: datetime, poster: Poster | None = None) -> list[dict[str, Any]]:
     current = base_datetime if base_datetime.tzinfo else base_datetime.replace(tzinfo=timezone.utc)
-    posting_poster = poster or _build_poster()
     batch_size = _posting_batch_size()
     results: list[dict[str, Any]] = []
 
     with SessionLocal() as session:
         due_posts = _claim_due_posts(session, current, batch_size=batch_size)
         engagement_attempts = 0
+        token_provider = AccountTokenProvider(session)
+        tokens_by_agent: dict[int, str] = {}
+
+        if poster is None and os.getenv("USE_REAL_X") == "1":
+            for post in due_posts:
+                if post.posted_at is not None:
+                    continue
+                agent = session.get(Agent, post.agent_id)
+                if agent is None:
+                    continue
+                try:
+                    tokens_by_agent[post.agent_id] = token_provider.token_for_agent(agent, current)
+                except XAuthRefreshError:
+                    payload = {"type": "XAuthRefreshError", "message": "x_auth_refresh_failed"}
+                    _append_pdca_error(session, post.agent_id, current.date(), payload)
+                    results.append({"post_id": post.id, "status": "skipped", "reason": "x_auth_refresh_failed"})
+            posting_poster = _build_poster(tokens_by_agent)
+        else:
+            posting_poster = poster or _build_poster()
 
         for post in due_posts:
             if post.posted_at is not None:
+                continue
+            if any(item.get("post_id") == post.id and item.get("status") == "skipped" for item in results):
                 continue
             try:
                 agent = session.get(Agent, post.agent_id)
@@ -198,3 +291,10 @@ def run_posting_jobs(base_datetime: datetime, poster: Poster | None = None) -> l
         session.commit()
 
     return results
+
+
+def _extract_tweet_id(url: str) -> str:
+    matched = re.search(r"/status/(\d+)", url)
+    if not matched:
+        raise ValueError("target_post_url_invalid")
+    return matched.group(1)
