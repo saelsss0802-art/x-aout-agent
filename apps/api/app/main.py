@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 from sqlalchemy import delete, select
 
-from core.models import Account, OAuthState, XAuthToken
+from core.models import Account, Agent, AgentStatus, AuditLog, CostLog, DailyPDCA, OAuthState, XAuthToken
 
 from .db import SessionLocal
 from .oauth.x_oauth import (
@@ -23,9 +25,187 @@ from .oauth.x_oauth import (
 app = FastAPI(title="x-aout-agent-api")
 
 
+class StopRequest(BaseModel):
+    reason: str
+    until: datetime | None = None
+
+
+def _cost_to_dict(cost: CostLog | None) -> dict[str, float | int | None]:
+    if cost is None:
+        return {
+            "x_api_cost_estimate": 0.0,
+            "llm_cost": 0.0,
+            "total": 0.0,
+            "x_usage_units": None,
+            "x_api_cost_actual": None,
+        }
+    return {
+        "x_api_cost_estimate": float(Decimal(cost.x_api_cost_estimate)),
+        "llm_cost": float(Decimal(cost.llm_cost)),
+        "total": float(Decimal(cost.total)),
+        "x_usage_units": cost.x_usage_units,
+        "x_api_cost_actual": float(Decimal(cost.x_api_cost_actual)) if cost.x_api_cost_actual is not None else None,
+    }
+
+
+def _agent_to_dict(agent: Agent) -> dict[str, object]:
+    return {
+        "id": agent.id,
+        "account_id": agent.account_id,
+        "status": agent.status.value,
+        "stop_reason": agent.stop_reason,
+        "stopped_at": agent.stopped_at.isoformat() if agent.stopped_at else None,
+        "stop_until": agent.stop_until.isoformat() if agent.stop_until else None,
+        "daily_budget": agent.daily_budget,
+    }
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/agents")
+def list_agents() -> dict[str, object]:
+    today = date.today()
+    with SessionLocal() as session:
+        agents = session.scalars(select(Agent).order_by(Agent.id.asc())).all()
+        rows: list[dict[str, object]] = []
+        for agent in agents:
+            cost = session.scalar(select(CostLog).where(CostLog.agent_id == agent.id, CostLog.date == today))
+            latest_pdca = session.scalar(
+                select(DailyPDCA).where(DailyPDCA.agent_id == agent.id).order_by(DailyPDCA.date.desc()).limit(1)
+            )
+            row = _agent_to_dict(agent)
+            row["today_cost"] = _cost_to_dict(cost)
+            row["latest_pdca_date"] = latest_pdca.date.isoformat() if latest_pdca else None
+            rows.append(row)
+
+        app_wide_cost = session.scalar(select(CostLog).where(CostLog.agent_id == 0, CostLog.date == today))
+
+    return {
+        "date": today.isoformat(),
+        "app_wide_usage": {
+            "x_usage_units": app_wide_cost.x_usage_units if app_wide_cost else None,
+            "x_api_cost_actual": float(Decimal(app_wide_cost.x_api_cost_actual)) if app_wide_cost and app_wide_cost.x_api_cost_actual is not None else None,
+        },
+        "agents": rows,
+    }
+
+
+@app.get("/api/agents/{agent_id}")
+def get_agent(agent_id: int) -> dict[str, object]:
+    with SessionLocal() as session:
+        agent = session.get(Agent, agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="agent_not_found")
+
+        pdca_rows = session.scalars(
+            select(DailyPDCA).where(DailyPDCA.agent_id == agent_id).order_by(DailyPDCA.date.desc()).limit(7)
+        ).all()
+
+    result = _agent_to_dict(agent)
+    result["feature_toggles"] = agent.feature_toggles or {}
+    result["daily_pdca"] = [
+        {
+            "date": row.date.isoformat(),
+            "analytics_summary": row.analytics_summary or {},
+        }
+        for row in pdca_rows
+    ]
+    return result
+
+
+@app.get("/api/agents/{agent_id}/audit")
+def get_agent_audit(agent_id: int, limit: int = Query(20, ge=1, le=200)) -> dict[str, object]:
+    with SessionLocal() as session:
+        agent = session.get(Agent, agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="agent_not_found")
+        rows = session.scalars(
+            select(AuditLog).where(AuditLog.agent_id == agent_id).order_by(AuditLog.created_at.desc()).limit(limit)
+        ).all()
+
+    return {
+        "agent_id": agent_id,
+        "items": [
+            {
+                "date": row.date.isoformat(),
+                "source": row.source,
+                "event_type": row.event_type,
+                "status": row.status,
+                "reason": row.reason,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in rows
+        ],
+    }
+
+
+@app.post("/api/agents/{agent_id}/stop")
+def stop_agent(agent_id: int, payload: StopRequest) -> dict[str, str]:
+    reason = payload.reason.strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="reason_required")
+
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as session:
+        agent = session.get(Agent, agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="agent_not_found")
+
+        stop_until = payload.until
+        if stop_until is not None and stop_until.tzinfo is None:
+            stop_until = stop_until.replace(tzinfo=timezone.utc)
+
+        agent.status = AgentStatus.stopped
+        agent.stop_reason = reason
+        agent.stopped_at = now
+        agent.stop_until = stop_until
+
+        session.add(
+            AuditLog(
+                agent_id=agent_id,
+                date=now.date(),
+                source="dashboard",
+                event_type="manual_stop",
+                status="success",
+                reason=reason,
+                payload_json={"until": stop_until.isoformat() if stop_until else None},
+            )
+        )
+        session.commit()
+
+    return {"status": "stopped"}
+
+
+@app.post("/api/agents/{agent_id}/resume")
+def resume_agent(agent_id: int) -> dict[str, str]:
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as session:
+        agent = session.get(Agent, agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="agent_not_found")
+
+        agent.status = AgentStatus.active
+        agent.stop_reason = None
+        agent.stopped_at = None
+        agent.stop_until = None
+
+        session.add(
+            AuditLog(
+                agent_id=agent_id,
+                date=now.date(),
+                source="dashboard",
+                event_type="manual_resume",
+                status="success",
+                reason=None,
+                payload_json={},
+            )
+        )
+        session.commit()
+
+    return {"status": "active"}
 
 
 def _apply_token_payload(account_id: int, payload: dict[str, object]) -> XAuthToken:
