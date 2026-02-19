@@ -36,6 +36,7 @@ class AgentStatus(str, enum.Enum):
     active = "active"
     paused = "paused"
     disabled = "disabled"
+    stopped = "stopped"
 
 
 class PostType(str, enum.Enum):
@@ -97,6 +98,9 @@ class Agent(Base):
     daily_budget: Mapped[int] = mapped_column(Integer, nullable=False, default=300, server_default="300")
     budget_split_x: Mapped[int] = mapped_column(Integer, nullable=False, default=100, server_default="100")
     budget_split_llm: Mapped[int] = mapped_column(Integer, nullable=False, default=200, server_default="200")
+    stop_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    stop_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     account: Mapped[Account] = relationship(back_populates="agents")
     target_accounts: Mapped[list["TargetAccount"]] = relationship(back_populates="agent")
@@ -135,6 +139,7 @@ class Post(Base):
     __table_args__ = (
         Index("ix_posts_posted_at", "posted_at"),
         UniqueConstraint("agent_id", "external_id", name="uq_posts_agent_external_id"),
+        UniqueConstraint("agent_id", "content_hash", "content_bucket_date", name="uq_posts_agent_content_dedupe"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -148,6 +153,8 @@ class Post(Base):
     target_post_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     thread_parts_json: Mapped[list[str] | None] = mapped_column(JSONType, nullable=True)
     allow_url: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="0")
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    content_bucket_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     experiment_id: Mapped[int | None] = mapped_column(ForeignKey("experiments.id"), nullable=True)
@@ -376,6 +383,23 @@ class FetchLog(Base):
     summary_json: Mapped[dict[str, Any] | None] = mapped_column(JSONType, nullable=True)
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     cost_estimate: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    __table_args__ = (Index("ix_audit_logs_agent_date", "agent_id", "date"), Index("ix_audit_logs_source", "source"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id"), nullable=False, index=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSONType, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

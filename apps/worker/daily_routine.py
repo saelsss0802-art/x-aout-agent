@@ -18,8 +18,10 @@ from core import (
     ExternalPost,
     ExternalPostMetrics,
     FetchLimiter,
+    GuardManager,
     RateLimiter,
     SearchLimiter,
+    build_post_content_hash,
     TargetPost,
     XClient,
     XUsage,
@@ -302,6 +304,17 @@ def _create_next_day_posts(
     for idx, draft in enumerate(plan_result.drafts):
         if draft.target_post_url:
             used_urls.add(draft.target_post_url)
+        content_hash = build_post_content_hash(draft.text, draft.thread_parts)
+        bucket_date = scheduled_at.date()
+        duplicate = session.scalar(
+            select(Post).where(
+                Post.agent_id == agent.id,
+                Post.content_hash == content_hash,
+                Post.content_bucket_date == bucket_date,
+            )
+        )
+        if duplicate is not None:
+            continue
         post = Post(
             agent_id=agent.id,
             content=draft.text,
@@ -310,6 +323,8 @@ def _create_next_day_posts(
             target_post_url=draft.target_post_url,
             thread_parts_json=draft.thread_parts,
             allow_url=draft.allow_url,
+            content_hash=content_hash,
+            content_bucket_date=bucket_date,
             scheduled_at=scheduled_at + timedelta(minutes=5 * (len(existing) + idx)),
             posted_at=None,
         )
@@ -763,6 +778,26 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
 
     with SessionLocal() as session:
         agent = _ensure_agent(session, agent_id)
+        guard = GuardManager(session)
+        if not guard.is_agent_runnable(agent, now):
+            reason = "agent_stopped" if agent.status == AgentStatus.stopped else f"agent_status_{agent.status.value}"
+            guard.record_audit(
+                agent_id=agent.id,
+                target_date=target_date,
+                source="daily_routine",
+                event_type="execution_skip",
+                status="skipped",
+                reason=reason,
+                payload={"stop_until": agent.stop_until.isoformat() if agent.stop_until else None},
+            )
+            session.commit()
+            return {
+                "target_date": target_date,
+                "log_path": None,
+                "posts": 0,
+                "status": "skip",
+                "reason": reason,
+            }
         x_client = x_client or _build_x_client(agent.account)
         if os.getenv("USE_GEMINI_WEB_SEARCH") == "1":
             web_search_client = GeminiWebSearchClient()
@@ -972,12 +1007,30 @@ def run_daily_routine(agent_id: int, base_date: date, x_client: XClient | None =
         usage_summary: dict[str, object]
         try:
             usage_summary = reconcile_app_usage(session, usage_date=target_date)
+            guard.record_audit(
+                agent_id=agent.id,
+                target_date=target_date,
+                source="usage",
+                event_type="reconcile",
+                status="success" if usage_summary.get("x_usage_reconciled") else "skipped",
+                reason=None if usage_summary.get("x_usage_reconciled") else "usage_disabled",
+                payload={"x_usage_reconciled": bool(usage_summary.get("x_usage_reconciled"))},
+            )
         except Exception as exc:
             usage_summary = {
                 "x_usage_reconciled": False,
                 "usage_fetch_failed": True,
                 "usage_error": str(exc)[:160],
             }
+            guard.record_audit(
+                agent_id=agent.id,
+                target_date=target_date,
+                source="usage",
+                event_type="reconcile",
+                status="failed",
+                reason=type(exc).__name__,
+                payload={"message": str(exc)[:120]},
+            )
 
         analytics = dict(pdca.analytics_summary or {})
         analytics.update(usage_summary)

@@ -1,7 +1,16 @@
 """Shared domain package for API/worker."""
 
 from .db import Base
-from .controls import BudgetExceededError, BudgetLedger, FetchLimiter, RateLimiter, SearchLimiter, UsageReconciler
+from .controls import (
+    BudgetExceededError,
+    BudgetLedger,
+    FetchLimiter,
+    GuardManager,
+    RateLimiter,
+    SearchLimiter,
+    UsageReconciler,
+    build_post_content_hash,
+)
 from .interfaces import Poster, WorkerJob
 from .models import Heartbeat
 from .placeholders import DomainPlaceholder
@@ -13,9 +22,11 @@ __all__ = [
     "BudgetLedger",
     "Heartbeat",
     "FetchLimiter",
+    "GuardManager",
     "RateLimiter",
     "SearchLimiter",
     "UsageReconciler",
+    "build_post_content_hash",
     "WorkerJob",
     "Poster",
     "DomainPlaceholder",

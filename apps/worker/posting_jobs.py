@@ -11,9 +11,9 @@ import httpx
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session
 
-from core import BudgetExceededError, BudgetLedger, Poster, RateLimiter
+from core import BudgetExceededError, BudgetLedger, GuardManager, Poster, RateLimiter, build_post_content_hash
 from core.db import SessionLocal
-from core.models import ActionType, Agent, DailyPDCA, Post, PostType, XAuthToken
+from core.models import ActionType, Agent, AgentStatus, AuditLog, DailyPDCA, Post, PostType, XAuthToken
 
 from .real_x_client import RealXClient
 from .usage_reconcile import reconcile_app_usage
@@ -206,6 +206,28 @@ def _append_pdca_error(session, agent_id: int, target_date, error_payload: dict[
     pdca.analytics_summary = summary
 
 
+def _recent_consecutive_failures(
+    session: Session,
+    *,
+    agent_id: int,
+    source: str,
+    event_type: str,
+    limit: int = 3,
+ ) -> int:
+    session.flush()
+    logs = session.scalars(
+        select(AuditLog)
+        .where(AuditLog.agent_id == agent_id, AuditLog.source == source, AuditLog.event_type == event_type)
+        .order_by(AuditLog.id.desc())
+        .limit(limit)
+    ).all()
+    if len(logs) < limit:
+        return 0
+    if all(log.status == "failed" for log in logs):
+        return len(logs)
+    return 0
+
+
 def _post_with_type(posting_poster: Poster, post: Post) -> str:
     if post.type == PostType.tweet:
         return posting_poster.post_text(post.agent_id, post.content)
@@ -237,6 +259,7 @@ def run_posting_jobs(base_datetime: datetime, poster: Poster | None = None) -> l
         engagement_attempts = 0
         token_provider = AccountTokenProvider(session)
         tokens_by_agent: dict[int, str] = {}
+        guard = GuardManager(session)
 
         if poster is None and os.getenv("USE_REAL_X") == "1":
             for post in due_posts:
@@ -245,11 +268,41 @@ def run_posting_jobs(base_datetime: datetime, poster: Poster | None = None) -> l
                 agent = session.get(Agent, post.agent_id)
                 if agent is None:
                     continue
+                if not guard.is_agent_runnable(agent, current):
+                    reason = "agent_stopped" if agent.status == AgentStatus.stopped else f"agent_status_{agent.status.value}"
+                    guard.record_audit(
+                        agent_id=agent.id,
+                        target_date=current.date(),
+                        source="posting_jobs",
+                        event_type="posting",
+                        status="skipped",
+                        reason=reason,
+                        payload={"post_id": post.id},
+                    )
+                    results.append({"post_id": post.id, "status": "skipped", "reason": reason})
+                    continue
                 try:
                     tokens_by_agent[post.agent_id] = token_provider.token_for_agent(agent, current)
                 except XAuthRefreshError:
                     payload = {"type": "XAuthRefreshError", "message": "x_auth_refresh_failed"}
                     _append_pdca_error(session, post.agent_id, current.date(), payload)
+                    guard.record_audit(
+                        agent_id=post.agent_id,
+                        target_date=current.date(),
+                        source="oauth",
+                        event_type="refresh",
+                        status="failed",
+                        reason="x_auth_refresh_failed",
+                        payload={"post_id": post.id},
+                    )
+                    if _recent_consecutive_failures(session, agent_id=post.agent_id, source="oauth", event_type="refresh") >= 3:
+                        guard.maybe_auto_stop(
+                            post.agent_id,
+                            now=current,
+                            reason="auto_anomaly_oauth_refresh_failures",
+                            source="oauth",
+                            payload={"threshold": 3},
+                        )
                     results.append({"post_id": post.id, "status": "skipped", "reason": "x_auth_refresh_failed"})
             posting_poster = _build_poster(tokens_by_agent)
         else:
@@ -264,6 +317,19 @@ def run_posting_jobs(base_datetime: datetime, poster: Poster | None = None) -> l
                 agent = session.get(Agent, post.agent_id)
                 if agent is None:
                     raise RuntimeError("agent_not_found")
+                if not guard.is_agent_runnable(agent, current):
+                    reason = "agent_stopped" if agent.status == AgentStatus.stopped else f"agent_status_{agent.status.value}"
+                    guard.record_audit(
+                        agent_id=agent.id,
+                        target_date=current.date(),
+                        source="posting_jobs",
+                        event_type="posting",
+                        status="skipped",
+                        reason=reason,
+                        payload={"post_id": post.id},
+                    )
+                    results.append({"post_id": post.id, "status": "skipped", "reason": reason})
+                    continue
 
                 if post.type in (PostType.reply, PostType.quote_rt):
                     limiter = RateLimiter(session, agent_id=post.agent_id, target_date=current.date(), daily_total_limit=3)
@@ -271,9 +337,44 @@ def run_posting_jobs(base_datetime: datetime, poster: Poster | None = None) -> l
                     if limiter.is_limited(action_type=action_type, requested=engagement_attempts + 1):
                         payload = {"type": "rate_limited", "message": "reply_quote_daily_limit_reached"}
                         _append_pdca_error(session, post.agent_id, current.date(), payload)
+                        guard.record_audit(
+                            agent_id=agent.id,
+                            target_date=current.date(),
+                            source="posting_jobs",
+                            event_type="posting",
+                            status="skipped",
+                            reason="rate_limited",
+                            payload={"post_id": post.id, "type": post.type.value},
+                        )
                         results.append({"post_id": post.id, "status": "skipped", "reason": "rate_limited"})
                         continue
                     engagement_attempts += 1
+
+                content_hash = post.content_hash or build_post_content_hash(post.content, post.thread_parts_json)
+                post.content_hash = content_hash
+                bucket_date = post.content_bucket_date or current.date()
+                post.content_bucket_date = bucket_date
+                duplicate = session.scalar(
+                    select(Post).where(
+                        Post.agent_id == post.agent_id,
+                        Post.id != post.id,
+                        Post.content_hash == content_hash,
+                        Post.content_bucket_date == bucket_date,
+                        Post.posted_at.is_not(None),
+                    )
+                )
+                if duplicate is not None:
+                    guard.record_audit(
+                        agent_id=agent.id,
+                        target_date=current.date(),
+                        source="posting_jobs",
+                        event_type="posting",
+                        status="skipped",
+                        reason="duplicate_content",
+                        payload={"post_id": post.id, "duplicate_post_id": duplicate.id},
+                    )
+                    results.append({"post_id": post.id, "status": "skipped", "reason": "duplicate_content"})
+                    continue
 
                 ledger = BudgetLedger(
                     session,
@@ -289,28 +390,88 @@ def run_posting_jobs(base_datetime: datetime, poster: Poster | None = None) -> l
                 post.posted_at = current
                 ledger.commit()
                 session.flush()
+                guard.record_audit(
+                    agent_id=agent.id,
+                    target_date=current.date(),
+                    source="posting_jobs",
+                    event_type="posting",
+                    status="success",
+                    payload={"post_id": post.id, "external_id": external_id},
+                )
                 results.append({"post_id": post.id, "status": "posted", "external_id": external_id})
             except InvalidTargetUrlError as exc:
                 payload = {"type": "invalid_target_url", "message": str(exc)}
                 _append_pdca_error(session, post.agent_id, current.date(), payload)
                 _log_posting_error(post.id, payload)
+                guard.record_audit(
+                    agent_id=post.agent_id,
+                    target_date=current.date(),
+                    source="posting_jobs",
+                    event_type="posting",
+                    status="skipped",
+                    reason="invalid_target_url",
+                    payload={"post_id": post.id},
+                )
                 results.append({"post_id": post.id, "status": "skipped", "reason": "invalid_target_url"})
             except BudgetExceededError as exc:
                 payload = {"type": type(exc).__name__, "message": str(exc)}
                 _append_pdca_error(session, post.agent_id, current.date(), payload)
                 _log_posting_error(post.id, payload)
+                guard.record_audit(
+                    agent_id=post.agent_id,
+                    target_date=current.date(),
+                    source="posting_jobs",
+                    event_type="posting",
+                    status="failed",
+                    reason="budget_exceeded",
+                    payload={"post_id": post.id},
+                )
                 results.append({"post_id": post.id, "status": "failed", "error": payload})
             except Exception as exc:  # noqa: BLE001
                 payload = {"type": type(exc).__name__, "message": str(exc)}
                 _append_pdca_error(session, post.agent_id, current.date(), payload)
                 _log_posting_error(post.id, payload)
+                guard.record_audit(
+                    agent_id=post.agent_id,
+                    target_date=current.date(),
+                    source="posting_jobs",
+                    event_type="posting",
+                    status="failed",
+                    reason=type(exc).__name__,
+                    payload={"post_id": post.id},
+                )
+                if _recent_consecutive_failures(session, agent_id=post.agent_id, source="posting_jobs", event_type="posting") >= 3:
+                    guard.maybe_auto_stop(
+                        post.agent_id,
+                        now=current,
+                        reason="auto_anomaly_posting_failures",
+                        source="posting_jobs",
+                        payload={"threshold": 3},
+                    )
                 results.append({"post_id": post.id, "status": "failed", "error": payload})
 
         if os.getenv("POSTING_USAGE_RECONCILE") == "1":
             try:
-                reconcile_app_usage(session, usage_date=current.date())
-            except Exception:
-                pass
+                usage_result = reconcile_app_usage(session, usage_date=current.date())
+                guard.record_audit(
+                    agent_id=0,
+                    target_date=current.date(),
+                    source="usage",
+                    event_type="reconcile",
+                    status="success" if usage_result.get("x_usage_reconciled") else "skipped",
+                    reason=None if usage_result.get("x_usage_reconciled") else "usage_disabled",
+                    payload={"x_usage_reconciled": bool(usage_result.get("x_usage_reconciled"))},
+                )
+            except Exception as exc:
+                guard.record_audit(
+                    agent_id=0,
+                    target_date=current.date(),
+                    source="usage",
+                    event_type="reconcile",
+                    status="failed",
+                    reason=type(exc).__name__,
+                    payload={"message": str(exc)[:120]},
+                )
 
         session.commit()
 
