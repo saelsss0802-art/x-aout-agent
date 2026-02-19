@@ -40,6 +40,7 @@ from core.models import (
     SearchLog,
 )
 from .gemini_web_search_client import GeminiWebSearchClient, GeminiWebSearchError
+from .content_planner import build_post_drafts
 from .summarize import GeminiSummarizeError, GeminiSummarizer
 from .web_fetch_client import WebFetchClient
 
@@ -173,10 +174,6 @@ def _scheduled_datetime_for_plan(target_date: date) -> datetime:
     return datetime(next_date.year, next_date.month, next_date.day, hour, minute, tzinfo=tz)
 
 
-def _generate_planned_content(agent_id: int, scheduled_at: datetime, index: int) -> str:
-    return f"Daily note agent={agent_id} slot={index + 1} at {scheduled_at.isoformat()}"
-
-
 def _create_next_day_posts(
     session: Session,
     *,
@@ -202,22 +199,45 @@ def _create_next_day_posts(
         )
     ).all()
     missing = max(0, planned_count - len(existing))
+    if missing <= 0:
+        return []
+
+    plan_result = build_post_drafts(
+        session,
+        agent_id=agent.id,
+        target_date=target_date,
+        posts_per_day=missing,
+        ledger=ledger,
+    )
+
+    analytics = dict(pdca.analytics_summary or {})
+    analytics["used_search_material"] = plan_result.used_search_material
+    pdca.analytics_summary = analytics
 
     created: list[dict[str, object]] = []
-    for idx in range(missing):
-        ledger.reserve(x_cost=Decimal("0.00"), llm_cost=Decimal("0.50"))
-        content = _generate_planned_content(agent.id, scheduled_at, len(existing) + idx)
+    for idx, draft in enumerate(plan_result.drafts):
         post = Post(
             agent_id=agent.id,
-            content=content,
-            type=PostType.tweet,
+            content=draft.text,
+            type=draft.type,
             media_urls=[],
+            target_post_url=draft.target_post_url,
+            thread_parts_json=draft.thread_parts,
+            allow_url=draft.allow_url,
             scheduled_at=scheduled_at + timedelta(minutes=5 * (len(existing) + idx)),
             posted_at=None,
         )
         session.add(post)
         session.flush()
-        created.append({"id": post.id, "scheduled_at": post.scheduled_at.isoformat(), "type": post.type.value})
+        created.append(
+            {
+                "id": post.id,
+                "scheduled_at": post.scheduled_at.isoformat(),
+                "type": post.type.value,
+                "allow_url": post.allow_url,
+                "has_target_post_url": bool(post.target_post_url),
+            }
+        )
 
     posts_created = list(pdca.posts_created or [])
     posts_created.extend(created)

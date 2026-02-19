@@ -41,6 +41,7 @@ class AgentStatus(str, enum.Enum):
 class PostType(str, enum.Enum):
     tweet = "tweet"
     thread = "thread"
+    reply = "reply"
     quote_rt = "quote_rt"
     poll = "poll"
 
@@ -143,6 +144,9 @@ class Post(Base):
         Enum(PostType, name="post_type_enum", validate_strings=True), nullable=False
     )
     media_urls: Mapped[list[str]] = mapped_column(JSONType, nullable=False, default=list)
+    target_post_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    thread_parts_json: Mapped[list[str] | None] = mapped_column(JSONType, nullable=True)
+    allow_url: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="0")
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     experiment_id: Mapped[int | None] = mapped_column(ForeignKey("experiments.id"), nullable=True)
