@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import date
 
+import pytest
+
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
@@ -84,3 +86,56 @@ def test_stop_resume_updates_agent_and_audit(tmp_path) -> None:
         assert agent.stop_reason is None
         count_after_resume = session.scalar(select(func.count(AuditLog.id)).where(AuditLog.agent_id == agent_id))
         assert count_after_resume == 2
+
+
+def test_patch_agent_updates_budget_and_logs_audit(tmp_path) -> None:
+    test_session = _make_test_session_factory(tmp_path)
+    agent_id = _seed_minimum_data(test_session)
+    main.SessionLocal = test_session
+
+    client = TestClient(main.app)
+    response = client.patch(f"/api/agents/{agent_id}", json={"daily_budget": 420})
+
+    assert response.status_code == 200
+    assert response.json()["daily_budget"] == 420
+    with test_session() as session:
+        agent = session.get(Agent, agent_id)
+        assert agent is not None
+        assert agent.daily_budget == 420
+        count = session.scalar(select(func.count(AuditLog.id)).where(AuditLog.agent_id == agent_id))
+        assert count == 1
+
+
+def test_patch_agent_merges_feature_toggles_and_keeps_existing_keys(tmp_path) -> None:
+    test_session = _make_test_session_factory(tmp_path)
+    agent_id = _seed_minimum_data(test_session)
+    main.SessionLocal = test_session
+
+    client = TestClient(main.app)
+    response = client.patch(
+        f"/api/agents/{agent_id}",
+        json={"feature_toggles": {"posts_per_day": 2, "auto_post": True}},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["feature_toggles"]["posts_per_day"] == 2
+    assert payload["feature_toggles"]["auto_post"] is True
+    assert payload["feature_toggles"]["posting"] is True
+
+    with test_session() as session:
+        logs = session.scalars(select(AuditLog).where(AuditLog.agent_id == agent_id).order_by(AuditLog.id.asc())).all()
+        assert len(logs) == 1
+        assert logs[0].status == "success"
+        assert logs[0].event_type == "agent_update"
+
+
+@pytest.mark.parametrize("body", [{}, {"daily_budget": -1}])
+def test_patch_agent_rejects_invalid_payload(body, tmp_path) -> None:
+    test_session = _make_test_session_factory(tmp_path)
+    agent_id = _seed_minimum_data(test_session)
+    main.SessionLocal = test_session
+
+    client = TestClient(main.app)
+    response = client.patch(f"/api/agents/{agent_id}", json=body)
+    assert response.status_code == 400

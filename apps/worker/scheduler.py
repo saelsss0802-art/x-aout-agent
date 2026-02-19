@@ -126,6 +126,22 @@ def run_posting_once(base_datetime: datetime | None = None) -> list[dict[str, An
     return results
 
 
+def _posting_poll_seconds(default_seconds: int) -> int:
+    with SessionLocal() as session:
+        agents = session.scalars(select(Agent).where(Agent.status == AgentStatus.active)).all()
+    values: list[int] = []
+    for agent in agents:
+        toggles = agent.feature_toggles if isinstance(agent.feature_toggles, dict) else {}
+        raw = toggles.get("posting_poll_seconds")
+        if raw is None:
+            continue
+        try:
+            values.append(max(1, int(raw)))
+        except (TypeError, ValueError):
+            continue
+    return min(values) if values else max(1, default_seconds)
+
+
 def _count_active_agents() -> int:
     with SessionLocal() as session:
         return len(
@@ -141,7 +157,7 @@ def run_scheduler() -> None:
     minute = int(os.getenv("WORKER_DAILY_MINUTE", "0"))
 
     scheduler = BlockingScheduler(timezone=timezone)
-    posting_poll_seconds = int(os.getenv("POSTING_POLL_SECONDS", "300"))
+    posting_poll_seconds = _posting_poll_seconds(int(os.getenv("POSTING_POLL_SECONDS", "300")))
     scheduler.add_job(
         lambda: run_all_agents(base_date=date.today()),
         trigger="cron",
