@@ -16,6 +16,7 @@ from core.models import Agent, AgentStatus, DailyPDCA
 
 from .daily_routine import run_daily_routine
 from .posting_jobs import run_posting_jobs
+from .feature_toggles import read_int_toggle
 from .usage_reconcile import reconcile_app_usage
 
 
@@ -131,14 +132,8 @@ def _posting_poll_seconds(default_seconds: int) -> int:
         agents = session.scalars(select(Agent).where(Agent.status == AgentStatus.active)).all()
     values: list[int] = []
     for agent in agents:
-        toggles = agent.feature_toggles if isinstance(agent.feature_toggles, dict) else {}
-        raw = toggles.get("posting_poll_seconds")
-        if raw is None:
-            continue
-        try:
-            values.append(max(1, int(raw)))
-        except (TypeError, ValueError):
-            continue
+        value = read_int_toggle(agent, "posting_poll_seconds", default_seconds)
+        values.append(value)
     return min(values) if values else max(1, default_seconds)
 
 

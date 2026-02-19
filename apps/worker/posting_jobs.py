@@ -16,6 +16,7 @@ from core.db import SessionLocal
 from core.models import ActionType, Agent, AgentStatus, AuditLog, DailyPDCA, Post, PostType, XAuthToken
 
 from .real_x_client import RealXClient
+from .feature_toggles import read_int_toggle
 from .usage_reconcile import reconcile_app_usage
 
 X_TOKEN_URL = "https://api.x.com/2/oauth2/token"
@@ -152,15 +153,6 @@ def _build_poster(account_tokens: dict[int, str] | None = None) -> Poster:
     if os.getenv("USE_REAL_X") == "1":
         return RealPoster(account_tokens or {})
     return FakePoster()
-
-
-def _agent_toggle_int(agent: Agent, key: str, default: int) -> int:
-    toggles = agent.feature_toggles if isinstance(agent.feature_toggles, dict) else {}
-    value = toggles.get(key, default)
-    try:
-        return max(0, int(value))
-    except (TypeError, ValueError):
-        return default
 
 
 def _posting_batch_size() -> int:
@@ -345,7 +337,7 @@ def run_posting_jobs(base_datetime: datetime, poster: Poster | None = None) -> l
                         session,
                         agent_id=post.agent_id,
                         target_date=current.date(),
-                        daily_total_limit=_agent_toggle_int(agent, "reply_quote_daily_max", 3),
+                        daily_total_limit=read_int_toggle(agent, "reply_quote_daily_max", 3),
                     )
                     action_type = ActionType.reply if post.type == PostType.reply else ActionType.quote_rt
                     if limiter.is_limited(action_type=action_type, requested=engagement_attempts + 1):
