@@ -180,12 +180,27 @@ class RealXClient:
             impressions_unavailable=impressions_unavailable,
         )
 
-    def post_text(self, text: str) -> str:
-        payload = self._post_json("tweets", {"text": text})
+    def create_tweet(
+        self,
+        *,
+        text: str,
+        in_reply_to_tweet_id: str | None = None,
+        quote_tweet_id: str | None = None,
+    ) -> str:
+        body: dict[str, object] = {"text": text}
+        if in_reply_to_tweet_id:
+            body["reply"] = {"in_reply_to_tweet_id": in_reply_to_tweet_id}
+        if quote_tweet_id:
+            body["quote_tweet_id"] = quote_tweet_id
+
+        payload = self._post_json("tweets", body)
         data = payload.get("data")
         if not isinstance(data, dict) or not isinstance(data.get("id"), str):
             raise XApiError("X API post response missing tweet id")
         return data["id"]
+
+    def post_text(self, text: str) -> str:
+        return self.create_tweet(text=text)
 
     def get_daily_usage(self, usage_date: date) -> XUsage:
         start_time = datetime.combine(usage_date, time.min, tzinfo=timezone.utc)

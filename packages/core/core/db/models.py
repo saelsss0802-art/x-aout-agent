@@ -82,6 +82,7 @@ class Account(Base):
 
     agents: Mapped[list["Agent"]] = relationship(back_populates="account")
     knowledges: Mapped[list["AccountKnowledge"]] = relationship(back_populates="account")
+    x_auth_token: Mapped["XAuthToken | None"] = relationship(back_populates="account", uselist=False)
 
 
 class Agent(Base):
@@ -315,6 +316,41 @@ class SearchLog(Base):
     query: Mapped[str] = mapped_column(Text, nullable=False)
     results_json: Mapped[list[dict[str, Any]]] = mapped_column(JSONType, nullable=False, default=list)
     cost_estimate: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class XAuthToken(Base):
+    __tablename__ = "x_auth_tokens"
+    __table_args__ = (UniqueConstraint("account_id", name="uq_x_auth_tokens_account_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), nullable=False, index=True)
+    access_token: Mapped[str] = mapped_column(Text, nullable=False)
+    refresh_token: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    token_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    account: Mapped[Account] = relationship(back_populates="x_auth_token")
+
+
+class OAuthState(Base):
+    __tablename__ = "oauth_states"
+    __table_args__ = (UniqueConstraint("state", name="uq_oauth_states_state"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), nullable=False, index=True)
+    state: Mapped[str] = mapped_column(String(255), nullable=False)
+    code_verifier: Mapped[str] = mapped_column(String(255), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
