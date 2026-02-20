@@ -161,6 +161,10 @@ curl http://localhost:8000/health
 python -m alembic -c apps/api/alembic.ini upgrade head
 ```
 
+```bash
+python -m alembic -c apps/api/alembic.ini revision --autogenerate -m "add_new_table"
+```
+
 `apps/api/alembic/env.py` は `core.db.Base.metadata` を `target_metadata` として参照します。モデル定義は `packages/core` 側へ集約する方針です。
 
 ## Seed（ダミーデータ）
