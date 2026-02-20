@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.blocking import BlockingScheduler
 from sqlalchemy import select
 
-from core.db import Base, SessionLocal, engine
+from core.db import Base, SessionLocal, engine, get_database_url
 from core.models import Agent, AgentStatus, DailyPDCA
 
 from .daily_routine import run_daily_routine
@@ -21,8 +21,7 @@ from .usage_reconcile import reconcile_app_usage
 
 
 def _require_database_url() -> None:
-    if not os.getenv("DATABASE_URL"):
-        raise RuntimeError("DATABASE_URL is required")
+    get_database_url()
 
 
 def _target_date(base_date: date) -> date:

@@ -1,5 +1,5 @@
 from .base import Base
 from .models import Heartbeat
-from .session import DATABASE_URL, SessionLocal, engine
+from .session import SessionLocal, engine, get_database_url, get_engine
 
-__all__ = ["Base", "DATABASE_URL", "engine", "SessionLocal", "Heartbeat"]
+__all__ = ["Base", "get_database_url", "get_engine", "engine", "SessionLocal", "Heartbeat"]
