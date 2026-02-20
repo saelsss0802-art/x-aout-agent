@@ -1,3 +1,3 @@
-from core.db import SessionLocal, engine
+from core.db import Base, DATABASE_URL, SessionLocal, engine
 
-__all__ = ["SessionLocal", "engine"]
+__all__ = ["Base", "DATABASE_URL", "SessionLocal", "engine"]

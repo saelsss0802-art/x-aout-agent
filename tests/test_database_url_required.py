@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 
-def test_core_db_requires_database_url() -> None:
+def test_core_db_imports_without_database_url() -> None:
     env = os.environ.copy()
     env.pop("DATABASE_URL", None)
     env["PYTHONPATH"] = "packages/core"
@@ -17,5 +17,4 @@ def test_core_db_requires_database_url() -> None:
         env=env,
     )
 
-    assert result.returncode != 0
-    assert "DATABASE_URL is required" in result.stderr
+    assert result.returncode == 0
