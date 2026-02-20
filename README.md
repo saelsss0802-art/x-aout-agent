@@ -13,7 +13,7 @@ x-aout-agent の monorepo 初期骨格です。**永続DBは Supabase（ホス�
 - `scripts/dev.sh`: API + worker をローカルで同時起動
 - `scripts/seed.py`: ダミー seed スクリプト
 
-## セットアップ
+## 標準セットアップ（Supabase + Docker なし）
 
 ```bash
 python -m venv .venv
@@ -95,7 +95,42 @@ NEXT_PUBLIC_API_BASE_URL=http://localhost:8000 npm run dev
 
 Codex 環境では npm install がセキュリティ制限で失敗する場合がありますが、ローカルでは lockfile に従って起動できます。
 
-## 起動方法（Docker なし）
+## 起動手順（Docker なし / 標準）
+
+標準の起動順は次のとおりです。
+
+1. Python venv を作成して有効化
+2. 依存をインストール
+3. `.env` を作成し、Supabase の値を設定
+4. Alembic でマイグレーション
+5. API / worker を起動
+
+### 1〜4 を一括で実施
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e packages/core
+cp .env.example .env
+python -m alembic -c apps/api/alembic.ini upgrade head
+```
+
+### 5. API / worker の起動
+
+別々のターミナルで起動する場合:
+
+```bash
+# terminal 1
+source .venv/bin/activate
+uvicorn apps.api.app.main:app --host 0.0.0.0 --port 8000 --reload
+
+# terminal 2
+source .venv/bin/activate
+python -m apps.worker.main
+```
+
+同時起動する場合（補助スクリプト）:
 
 ```bash
 ./scripts/dev.sh
@@ -140,6 +175,6 @@ python scripts/seed.py
 pytest -q
 ```
 
-## Legacy: Docker compose
+## Legacy / Optional: Docker compose
 
 `infra/docker-compose.yml` は後方互換のため残していますが、標準のローカル開発手順では使用しません。
