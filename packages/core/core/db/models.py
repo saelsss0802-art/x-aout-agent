@@ -22,7 +22,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from . import Base
+from .base import Base
 
 JSONType = JSON().with_variant(JSONB, "postgresql")
 
